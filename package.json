@@ -1,0 +1,53 @@
+{
+  "name": "chalkline-board",
+  "private": false,
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/whiteboard.mjs dev chalkline",
+    "build": "node scripts/whiteboard.mjs build chalkline",
+    "build:desktop": "node scripts/whiteboard.mjs build-desktop chalkline",
+    "lint": "eslint .",
+    "preview": "node scripts/whiteboard.mjs preview chalkline",
+    "perf:probe": "node scripts/perf-probe.mjs",
+    "perf:gate": "node scripts/perf-gate.mjs",
+    "perf:stress": "node scripts/stress-probe.mjs",
+    "check:encoding": "powershell -ExecutionPolicy Bypass -File scripts/check-encoding.ps1",
+    "desktop:restore": "node scripts/whiteboard.mjs restore-desktop chalkline",
+    "desktop:publish": "node scripts/whiteboard.mjs publish-desktop chalkline",
+    "desktop:publish:singlefile": "node scripts/whiteboard.mjs publish-singlefile --profile chalkline",
+    "desktop:run": "node scripts/whiteboard.mjs run-desktop chalkline",
+    "release": "node scripts/release.mjs --profile chalkline --format multifile,installer",
+    "release:multifile": "node scripts/release.mjs --profile chalkline --format multifile",
+    "release:singlefile": "node scripts/release.mjs --profile chalkline --format singlefile",
+    "release:installer": "node scripts/release.mjs --profile chalkline --format installer"
+  },
+  "dependencies": {
+    "canvg": "^4.0.3",
+    "jspdf": "^4.2.1",
+    "konva": "^10.3.0",
+    "lucide-react": "^1.17.0",
+    "pdfjs-dist": "^5.7.284",
+    "perfect-freehand": "^1.2.3",
+    "polygon-clipping": "^0.15.7",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "react-konva": "^19.2.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^24.12.3",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^10.3.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.6.0",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.59.2",
+    "vite": "^8.0.12"
+  }
+}
