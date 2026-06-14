@@ -5,43 +5,61 @@ import path from 'node:path'
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const node = process.execPath
 const viteBin = path.join('node_modules', 'vite', 'bin', 'vite.js')
-const probe = path.join('scripts', 'perf-probe.mjs')
-const host = process.env.WHITEBOARD_PERF_HOST ?? '127.0.0.1'
-const port = process.env.WHITEBOARD_PERF_PORT ?? '5175'
-const url = `http://${host}:${port}/?perf=1`
+const probe = path.join('scripts', 'navigation-probe.mjs')
+const host = process.env.WHITEBOARD_NAV_HOST ?? '127.0.0.1'
+const blankPort = process.env.WHITEBOARD_NAV_PORT ?? '5179'
+const textbookPort = process.env.WHITEBOARD_NAV_TEXTBOOK_PORT ?? String(Number(blankPort) + 1)
 
-await assertPortIsFree(url)
-
-const server = spawnInRoot(node, [viteBin, '--mode', 'blank', '--host', host, '--port', port, '--strictPort'], {
-  stdio: ['ignore', 'pipe', 'pipe'],
+await runNavigationScenario({
+  mode: 'blank',
+  port: blankPort,
+  env: {
+    WHITEBOARD_NAV_SWITCHES: process.env.WHITEBOARD_NAV_SWITCHES ?? '80',
+    WHITEBOARD_NAV_PAGES: process.env.WHITEBOARD_NAV_PAGES ?? '120',
+    WHITEBOARD_NAV_STROKES_PER_PAGE: process.env.WHITEBOARD_NAV_STROKES_PER_PAGE ?? '6',
+    WHITEBOARD_NAV_MAX_AVG_SWITCH_MS: process.env.WHITEBOARD_NAV_MAX_AVG_SWITCH_MS ?? '120',
+  },
 })
 
-server.stdout.on('data', (chunk) => process.stdout.write(chunk))
-server.stderr.on('data', (chunk) => process.stderr.write(chunk))
+await runNavigationScenario({
+  mode: 'textbook',
+  port: textbookPort,
+  env: {
+    WHITEBOARD_NAV_INSTALL_PROJECT: '0',
+    WHITEBOARD_NAV_TEXTBOOK_SWITCH: '1',
+    WHITEBOARD_NAV_MAX_AVG_SWITCH_MS: process.env.WHITEBOARD_NAV_MAX_AVG_SWITCH_MS ?? '120',
+  },
+})
 
-try {
-  await waitForServer(url)
-  await run(node, [probe, url], {
-    WHITEBOARD_PERF_MOVES: process.env.WHITEBOARD_PERF_MOVES ?? '80',
-    WHITEBOARD_PERF_STROKES: process.env.WHITEBOARD_PERF_STROKES ?? '8',
-    WHITEBOARD_PERF_MAX_AVG_LIVE_DRAW_MS: process.env.WHITEBOARD_PERF_MAX_AVG_LIVE_DRAW_MS ?? '1',
-    WHITEBOARD_PERF_MAX_AVG_INPUT_TO_DRAW_MS: process.env.WHITEBOARD_PERF_MAX_AVG_INPUT_TO_DRAW_MS ?? '8',
-    WHITEBOARD_PERF_MAX_AVG_COMMITTED_RENDER_MS: process.env.WHITEBOARD_PERF_MAX_AVG_COMMITTED_RENDER_MS ?? '8',
+async function runNavigationScenario({ mode, port, env }) {
+  const url = `http://${host}:${port}/?perf=1`
+  await assertPortIsFree(url)
+
+  const server = spawnInRoot(node, [viteBin, '--mode', mode, '--host', host, '--port', port, '--strictPort'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
   })
-} finally {
-  stopProcessTree(server)
+
+  server.stdout.on('data', (chunk) => process.stdout.write(chunk))
+  server.stderr.on('data', (chunk) => process.stderr.write(chunk))
+
+  try {
+    await waitForServer(server, url)
+    await run(node, [probe, url], env)
+  } finally {
+    stopProcessTree(server)
+  }
 }
 
 async function assertPortIsFree(targetUrl) {
   try {
     await fetch(targetUrl, { signal: AbortSignal.timeout(1000) })
-    throw new Error(`Perf gate target is already serving before Vite starts: ${targetUrl}`)
+    throw new Error(`Navigation gate target is already serving before Vite starts: ${targetUrl}`)
   } catch (error) {
     if (error instanceof Error && error.message.includes('already serving')) throw error
   }
 }
 
-async function waitForServer(targetUrl) {
+async function waitForServer(server, targetUrl) {
   const deadline = Date.now() + 30000
   while (Date.now() < deadline) {
     if (server.exitCode !== null) throw new Error(`Vite exited early with ${server.exitCode}`)

@@ -6,8 +6,12 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <DefineConstants>$(DefineConstants);BLANK_WHITEBOARD</DefineConstants>
-    <AssemblyName>ChalklineBoard</AssemblyName>
+    <AssemblyName Condition="'$(AppAssemblyName)' == ''">ChalklineBoard</AssemblyName>
+    <AssemblyName Condition="'$(AppAssemblyName)' != ''">$(AppAssemblyName)</AssemblyName>
     <RootNamespace>OpenWhiteboardDesktop</RootNamespace>
+    <ApplicationIcon Condition="'$(AppIcon)' == ''">assets\whiteboard.ico</ApplicationIcon>
+    <ApplicationIcon Condition="'$(AppIcon)' != ''">$(AppIcon)</ApplicationIcon>
+    <AppDistDir Condition="'$(AppDistDir)' == ''">dist-desktop</AppDistDir>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <PublishSingleFile>false</PublishSingleFile>
@@ -18,6 +22,7 @@
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <CopyDocumentationFilesFromPackages>false</CopyDocumentationFilesFromPackages>
+    <DefineConstants>$(DefineConstants);SINGLE_FILE_PUBLISH</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
@@ -25,8 +30,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="..\dist-desktop\**\*.*" Link="app\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Condition="'$(PublishSingleFile)' != 'true'" />
-    <EmbeddedResource Include="..\dist-desktop\**\*.*" LogicalName="app/%(RecursiveDir)%(Filename)%(Extension)" />
+    <Content Include="..\$(AppDistDir)\**\*.*" Link="app\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Condition="'$(PublishSingleFile)' != 'true'" />
+    <Content Include="assets\whiteboard.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="assets\owbn.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="assets\projection.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="assets\textbook-book.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <EmbeddedResource Include="..\$(AppDistDir)\**\*.*" LogicalName="app/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
   <Target Name="RemoveSingleFilePublishDocs" AfterTargets="Publish" Condition="'$(PublishSingleFile)' == 'true'">

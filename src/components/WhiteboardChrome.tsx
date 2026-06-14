@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, BookOpen, Clock3, Crosshair, Eraser, FilePlus, Hand, ImagePlus, ListTree, Menu, Minimize2, MoreHorizontal, MousePointer2, PenLine, Undo2, X } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BookOpen, Clock3, Crosshair, Eraser, FilePlus, Hand, ImagePlus, ListTree, Menu, Minimize2, MoreHorizontal, MousePointer2, PenLine, Play, Undo2, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { ToolButton } from './ToolButton'
@@ -16,6 +16,7 @@ interface BottomToolbarProps {
   morePanelOpen: boolean
   bookPickerEnabled: boolean
   tocEnabled: boolean
+  presentationPlayable: boolean
   bookPickerOpen: boolean
   tocOpen: boolean
   onChooseTool: (tool: Tool) => void
@@ -23,6 +24,7 @@ interface BottomToolbarProps {
   onUndo: () => void
   onOpenBookPicker: () => void
   onOpenToc: () => void
+  onPlayPresentation: () => void
   onToggleClock: () => void
   onToggleMore: () => void
 }
@@ -37,6 +39,7 @@ function BottomToolbar({
   morePanelOpen,
   bookPickerEnabled,
   tocEnabled,
+  presentationPlayable,
   bookPickerOpen,
   tocOpen,
   onChooseTool,
@@ -44,6 +47,7 @@ function BottomToolbar({
   onUndo,
   onOpenBookPicker,
   onOpenToc,
+  onPlayPresentation,
   onToggleClock,
   onToggleMore,
 }: BottomToolbarProps) {
@@ -67,11 +71,12 @@ function BottomToolbar({
       <ToolButton active={tool === 'select'} label={labels.toolbar.select} icon={<MousePointer2 className="hite-toolbar-svg" />} onClick={() => onChooseTool('select')} />
       <ToolButton active={tool === 'pen'} label={labels.toolbar.pen} icon={<PenLine className="hite-toolbar-svg" />} onClick={() => onChooseTool('pen')} />
       <ToolButton active={tool === 'eraser'} label={labels.toolbar.eraser} icon={<Eraser className="hite-toolbar-svg" />} onClick={() => onChooseTool('eraser')} />
-      <ToolButton active={tool === 'laser'} label="Laser" icon={<Crosshair className="hite-toolbar-svg" />} onClick={() => onChooseTool('laser')} />
+      <ToolButton active={tool === 'laser'} label={labels.toolbar.laser} icon={<Crosshair className="hite-toolbar-svg" />} onClick={() => onChooseTool('laser')} />
       <ToolButton active={tool === 'pan'} label={labels.toolbar.pan} icon={<Hand className="hite-toolbar-svg" />} onClick={() => onChooseTool('pan')} />
       <ToolButton disabled={!pastCount} label={labels.toolbar.undo} icon={<Undo2 className="hite-toolbar-svg" />} onClick={onUndo} />
       {bookPickerEnabled && <ToolButton active={bookPickerOpen} label={labels.toolbar.books} icon={<BookOpen className="hite-toolbar-svg" />} onClick={onOpenBookPicker} />}
       {tocEnabled && <ToolButton active={tocOpen} label={labels.toolbar.toc} icon={<ListTree className="hite-toolbar-svg" />} onClick={onOpenToc} />}
+      {presentationPlayable && <ToolButton label="Play" icon={<Play className="hite-toolbar-svg" />} onClick={onPlayPresentation} />}
       <ToolButton active={clockPanelOpen} label={labels.toolbar.clock} icon={<Clock3 className="hite-toolbar-svg" />} onClick={onToggleClock} />
       <ToolButton active={morePanelOpen} label={labels.toolbar.more} icon={<MoreHorizontal className="hite-toolbar-svg" />} onClick={onToggleMore} />
     </nav>

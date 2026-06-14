@@ -29,6 +29,7 @@ interface UseStrokeLifecycleOptions {
   drawLiveInkSamples: (stroke: Stroke, samples: BoardPointerPoint[]) => void
   drawEraserCursor: (point: BoardPointerPoint | null) => void
   previewErasePoints: (points: BoardPointerPoint[]) => void
+  onEraserPreviewCommit?: () => void
 }
 
 const appendedStrokeSamples = (
@@ -71,6 +72,7 @@ function useStrokeLifecycle({
   drawLiveInkSamples,
   drawEraserCursor,
   previewErasePoints,
+  onEraserPreviewCommit,
 }: UseStrokeLifecycleOptions) {
   const draftStrokeRef = useRef<Stroke | null>(null)
   const lastEraserPointRef = useRef<BoardPointerPoint | null>(null)
@@ -165,10 +167,11 @@ function useStrokeLifecycle({
       const viewScale = Math.max(0.1, currentViewRef.current.scale)
       updateCurrentPage((page) => {
         const result = eraseStrokesAtPoints(page.strokes, points, eraserRadius, viewScale)
+        if (result.changed) onEraserPreviewCommit?.()
         return result.changed ? { ...page, strokes: result.strokes } : page
       })
     },
-    [currentViewRef, eraserRadius, updateCurrentPage],
+    [currentViewRef, eraserRadius, onEraserPreviewCommit, updateCurrentPage],
   )
 
   const flushPreviewEraserPoints = useCallback(() => {

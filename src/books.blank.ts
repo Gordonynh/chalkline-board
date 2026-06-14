@@ -6,14 +6,14 @@ export const DEFAULT_BOOK_ID = 'blank'
 export const builtInBooks: BuiltInBook[] = [
   {
     id: DEFAULT_BOOK_ID,
-    title: '纯白画布',
-    shortTitle: '纯白画布',
-    subtitle: '本地白板',
+    title: '\u7eaf\u767d\u753b\u5e03',
+    shortTitle: '\u7eaf\u767d\u753b\u5e03',
+    subtitle: '\u672c\u5730\u767d\u677f',
     pageCount: 1,
     toc: [],
     imageSize: () => ({ width: 1920, height: 1080 }),
     blankCanvas: true,
-    importsEnabled: false,
+    importsEnabled: true,
   },
 ]
 

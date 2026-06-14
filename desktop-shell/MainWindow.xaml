@@ -25,7 +25,8 @@
                 Background="White"
                 CornerRadius="14">
           <StackPanel>
-            <TextBlock Text="Chalkline Board &#x6B63;&#x5728;&#x542F;&#x52A8;"
+            <TextBlock x:Name="StartupTitle"
+                       Text="Chalkline Board &#x6B63;&#x5728;&#x542F;&#x52A8;"
                        FontSize="22"
                        FontWeight="SemiBold"
                        Foreground="#172033"

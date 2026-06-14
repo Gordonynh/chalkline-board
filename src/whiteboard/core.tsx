@@ -45,6 +45,19 @@ interface PageView {
   scale: number
 }
 
+interface BoardPresentation {
+  id: string
+  name: string
+  kind: 'pptx'
+  src: string
+  slideCount: number
+}
+
+interface BoardPresentationRef {
+  id: string
+  slideIndex: number
+}
+
 interface ScreenPoint {
   x: number
   y: number
@@ -61,6 +74,7 @@ interface BoardPage {
   id: string
   name: string
   image?: BoardImage
+  presentation?: BoardPresentationRef
   strokes: Stroke[]
   texts?: TextNote[]
   view: PageView
@@ -69,6 +83,7 @@ interface BoardPage {
 interface BoardProject {
   bookId: string
   pages: BoardPage[]
+  presentations?: BoardPresentation[]
   currentPageId: string
   updatedAt: number
 }
@@ -83,10 +98,14 @@ interface BoardPointerPoint {
   time: number
 }
 
-const DB_NAME = 'open-whiteboard-db'
+const APP_STORAGE_SCOPE =
+  import.meta.env.VITE_APP_KIND === 'textbook' ? 'textbook' : import.meta.env.VITE_APP_KIND === 'visualizer' ? 'visualizer' : 'blank'
+const DB_NAME = `open-whiteboard-db-${APP_STORAGE_SCOPE}`
+const LEGACY_DB_NAME = 'open-whiteboard-db'
 const DB_VERSION = 1
 const PROJECT_STORE = 'projects'
-const SELECTED_BOOK_KEY = 'open-whiteboard-selected-book'
+const SELECTED_BOOK_KEY = `open-whiteboard-selected-book-${APP_STORAGE_SCOPE}`
+const LEGACY_SELECTED_BOOK_KEY = 'open-whiteboard-selected-book'
 const EMPTY_PAGE_SIZE = { width: 1280, height: 720 }
 
 const standardPenColors = ['#000000', '#ef1f18', '#0f7bff', '#f97316', '#7c3aed', '#16a34a']
@@ -115,7 +134,7 @@ const toolLabels: Record<Tool, string> = {
   highlighter: '荧光',
   eraser: '橡皮',
   pan: '漫游',
-  laser: 'Laser',
+  laser: '\u6fc0\u5149',
 }
 const sourcePageLabel = (page: number) => String(page).padStart(3, '0')
 const sourcePageForBoardPage = (page: BoardPage) => {
@@ -203,7 +222,7 @@ const initialProject = (bookId = DEFAULT_BOOK_ID): BoardProject => {
   }
 }
 
-const getLastSelectedBookId = () => getBuiltInBook(localStorage.getItem(SELECTED_BOOK_KEY)).id
+const getLastSelectedBookId = () => getBuiltInBook(localStorage.getItem(SELECTED_BOOK_KEY) ?? localStorage.getItem(LEGACY_SELECTED_BOOK_KEY)).id
 
 const isStoredProjectForBook = (project: BoardProject | undefined, book: BuiltInBook): project is BoardProject =>
   project?.bookId === book.id &&
@@ -215,18 +234,20 @@ const isStoredProjectForBook = (project: BoardProject | undefined, book: BuiltIn
 
 const projectStoreKey = (bookId: string) => `builtin:${bookId}`
 
-const openDatabase = () =>
+const openDatabase = (databaseName = DB_NAME) =>
   new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    const request = indexedDB.open(databaseName, DB_VERSION)
     request.onerror = () => reject(request.error)
     request.onsuccess = () => resolve(request.result)
     request.onupgradeneeded = () => {
-      request.result.createObjectStore(PROJECT_STORE)
+      if (!request.result.objectStoreNames.contains(PROJECT_STORE)) {
+        request.result.createObjectStore(PROJECT_STORE)
+      }
     }
   })
 
 async function saveProject(project: BoardProject) {
-  const db = await openDatabase()
+  const db = await openDatabase(DB_NAME)
   await new Promise<void>((resolve, reject) => {
     const transaction = db.transaction(PROJECT_STORE, 'readwrite')
     transaction.objectStore(PROJECT_STORE).put(project, projectStoreKey(project.bookId ?? DEFAULT_BOOK_ID))
@@ -237,8 +258,8 @@ async function saveProject(project: BoardProject) {
   localStorage.setItem('open-whiteboard-last-save', String(project.updatedAt))
 }
 
-async function loadProject(bookId: string) {
-  const db = await openDatabase()
+async function readProjectFromDatabase(databaseName: string, bookId: string) {
+  const db = await openDatabase(databaseName)
   const project = await new Promise<BoardProject | undefined>((resolve, reject) => {
     const transaction = db.transaction(PROJECT_STORE, 'readonly')
     const request = transaction.objectStore(PROJECT_STORE).get(projectStoreKey(bookId))
@@ -249,13 +270,26 @@ async function loadProject(bookId: string) {
   return project
 }
 
+async function loadProject(bookId: string) {
+  const project = await readProjectFromDatabase(DB_NAME, bookId)
+  if (project || DB_NAME === LEGACY_DB_NAME) return project
+
+  const legacyProject = await readProjectFromDatabase(LEGACY_DB_NAME, bookId)
+  if (legacyProject) {
+    await saveProject(legacyProject)
+  }
+  return legacyProject
+}
+
 async function clearStoredProjects() {
-  await new Promise<void>((resolve) => {
-    const request = indexedDB.deleteDatabase(DB_NAME)
-    request.onsuccess = () => resolve()
-    request.onerror = () => resolve()
-    request.onblocked = () => resolve()
-  })
+  for (const databaseName of [DB_NAME, LEGACY_DB_NAME]) {
+    await new Promise<void>((resolve) => {
+      const request = indexedDB.deleteDatabase(databaseName)
+      request.onsuccess = () => resolve()
+      request.onerror = () => resolve()
+      request.onblocked = () => resolve()
+    })
+  }
   localStorage.removeItem('open-whiteboard-last-save')
 }
 
@@ -819,6 +853,8 @@ export {
 export type {
   BoardImage,
   BoardPage,
+  BoardPresentation,
+  BoardPresentationRef,
   BoardPointerPoint,
   BoardProject,
   HostCommand,

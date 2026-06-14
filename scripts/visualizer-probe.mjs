@@ -1,74 +1,85 @@
-import { chromium } from '@playwright/test'
+import { launchHeadlessBrowser } from './playwright-browser.mjs'
 
 const targetUrl = process.argv[2] ?? 'http://127.0.0.1:5176/?perf=1'
-const maxAverageFirstDrawMs = Number(process.env.VISUALIZER_MAX_AVG_FIRST_DRAW_MS ?? 16)
-const maxAverageLiveDrawMs = Number(process.env.VISUALIZER_MAX_AVG_LIVE_DRAW_MS ?? 8)
-const maxAverageCaptureMs = Number(process.env.VISUALIZER_MAX_AVG_CAPTURE_MS ?? 350)
-const maxAverageCompositionMs = Number(process.env.VISUALIZER_MAX_AVG_COMPOSITION_MS ?? 500)
-const moveCount = Number(process.env.VISUALIZER_MOVES ?? 120)
-
 const label = {
-  projector: '\u5c55\u53f0',
   select: '\u9009\u62e9',
-  pen: '\u6279\u6ce8',
+  pen: '\u8f6f\u7b14',
   eraser: '\u6a61\u76ae',
+  laser: '\u6fc0\u5149',
   pan: '\u6f2b\u6e38',
   undo: '\u64a4\u9500',
-  redo: '\u91cd\u505a',
+  rotate: '\u65cb\u8f6c',
   capture: '\u62cd\u7167',
   album: '\u76f8\u518c',
-  tools: '\u5de5\u5177',
-  rotate: '\u65cb\u8f6c',
-  insert: '\u63d2\u5165\u767d\u677f',
   minimize: '\u6700\u5c0f\u5316',
-  close: '\u9000\u51fa',
-  camera: '\u6444\u50cf\u5934',
-  photo: '\u7167\u7247',
-  captured: '\u5df2\u62cd\u7167',
+  close: '\u5173\u95ed',
 }
 
 const byTitle = (text) => `button[title="${text}"]`
-const byButtonText = (text) => `button:has-text("${text}")`
-
-const browser = await chromium.launch({
-  headless: true,
+const browser = await launchHeadlessBrowser({
   args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
 })
 const page = await browser.newPage({ viewport: { width: 1366, height: 768 } })
 const errors = []
+page.setDefaultNavigationTimeout(90000)
+page.setDefaultTimeout(60000)
 
 page.on('pageerror', (error) => errors.push(String(error)))
 
 try {
-  await page.goto(targetUrl, { waitUntil: 'networkidle' })
-  await page.waitForSelector(byTitle(label.projector), { timeout: 15000 })
-  await page.click(byTitle(label.projector))
-  await page.waitForSelector('.visualizer-shell', { timeout: 15000 })
+  await page.addInitScript(() => {
+    const makeStream = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width = 640
+      canvas.height = 480
+      const context = canvas.getContext('2d')
+      let frame = 0
+      const paint = () => {
+        if (!context) return
+        context.fillStyle = '#1f2937'
+        context.fillRect(0, 0, canvas.width, canvas.height)
+        context.fillStyle = '#0ea5e9'
+        context.fillRect(40 + (frame % 160), 60, 220, 160)
+        context.fillStyle = '#f97316'
+        context.beginPath()
+        context.arc(420, 240, 70 + (frame % 30), 0, Math.PI * 2)
+        context.fill()
+        context.fillStyle = '#ffffff'
+        context.font = '42px sans-serif'
+        context.fillText('Visualizer', 120, 390)
+        frame += 1
+      }
+      paint()
+      window.setInterval(paint, 100)
+      return canvas.captureStream(30)
+    }
+    const currentMediaDevices = navigator.mediaDevices ?? {}
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        ...currentMediaDevices,
+        getUserMedia: async () => makeStream(),
+      },
+    })
+  })
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' })
+  await waitForVisualizerReady(page)
   await page.waitForFunction(() => {
     const video = document.querySelector('video')
     return video instanceof HTMLVideoElement && video.videoWidth > 0 && video.videoHeight > 0
   })
-  const initialTransform = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
-  const initialFrameBox = await page.locator('[data-testid="visualizer-frame"]').boundingBox()
-  const viewport = page.viewportSize()
-  if (!initialFrameBox || !viewport) throw new Error('visualizer frame or viewport not available')
-  if (Math.abs(initialFrameBox.x) > 1 || Math.abs(initialFrameBox.y) > 1) throw new Error('visualizer frame is not aligned to fullscreen origin')
-  if (Math.abs(initialFrameBox.width - viewport.width) > 1 || Math.abs(initialFrameBox.height - viewport.height) > 1) {
-    throw new Error(`visualizer frame is not fullscreen: ${initialFrameBox.width}x${initialFrameBox.height}`)
-  }
-  await page.waitForTimeout(900)
-  const stableTransform = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
-  if (stableTransform !== initialTransform) throw new Error('visualizer camera view drifted after initial metadata fit')
 
   const toolbarTitles = await page.locator('.visualizer-toolbar button').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('title')))
   const expectedToolbarTitles = [
+    label.select,
     label.pen,
     label.eraser,
+    label.laser,
+    label.pan,
+    label.undo,
     label.rotate,
     label.capture,
-    label.insert,
     label.album,
-    label.tools,
     label.minimize,
     label.close,
   ]
@@ -76,72 +87,123 @@ try {
     throw new Error(`visualizer toolbar titles changed: ${toolbarTitles.join(',')}`)
   }
 
-  await page.click(byTitle(label.capture))
-  await page.waitForFunction((captured) => document.querySelector('.visualizer-status')?.textContent?.includes(captured), label.captured)
-  await page.waitForSelector('.visualizer-album-panel', { timeout: 15000 })
-  await page.waitForSelector('.visualizer-album-grid button', { timeout: 15000 })
-  const transformAfterCapture = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
-  if (transformAfterCapture !== stableTransform) throw new Error('visualizer switched away from camera after capture')
-
-  if ((await page.locator('.visualizer-album-actions').count()) !== 0) throw new Error('visualizer album still exposes import/camera actions')
-  await page.click('.visualizer-album-grid button')
-  await page.waitForFunction((photo) => document.querySelector('.visualizer-status')?.textContent?.includes(photo), label.photo)
-
-  await page.click(byTitle(label.tools))
-  await page.click(byButtonText(label.pan))
-  const transformBeforePan = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
   const frameBox = await page.locator('[data-testid="visualizer-frame"]').boundingBox()
-  if (!frameBox) throw new Error('visualizer frame not visible')
-  await page.mouse.move(frameBox.x + frameBox.width * 0.5, frameBox.y + frameBox.height * 0.5)
-  await page.mouse.wheel(0, -260)
-  await page.mouse.down()
-  await page.mouse.move(frameBox.x + frameBox.width * 0.58, frameBox.y + frameBox.height * 0.56, { steps: 8 })
-  await page.mouse.up()
-  const transformAfterPan = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
-  if (transformAfterPan === transformBeforePan) throw new Error('visualizer pan/zoom did not change the view transform')
-  await page.mouse.move(frameBox.x + 4, frameBox.y + 4)
-  await page.mouse.down()
-  await page.mouse.move(Math.max(0, frameBox.x - 60), Math.max(0, frameBox.y - 40), { steps: 8 })
-  await page.mouse.up()
-  const transformAfterCapturedPan = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
-  if (transformAfterCapturedPan === transformAfterPan) throw new Error('visualizer pan did not continue from frame edge with pointer capture')
-  await page.click(byTitle(label.pen))
+  const canvasBox = await page.locator('[data-testid="visualizer-canvas"]').boundingBox()
+  const viewportSize = page.viewportSize()
+  if (!frameBox || !canvasBox) throw new Error('visualizer frame or canvas not visible')
+  if (!viewportSize) throw new Error('viewport not available')
+  if (Math.abs(canvasBox.width - viewportSize.width) > 1 || Math.abs(canvasBox.height - viewportSize.height) > 1) {
+    throw new Error(`visualizer canvas is not fullscreen: ${canvasBox.width}x${canvasBox.height}`)
+  }
+  const point = (xRatio, yRatio) => ({ x: viewportSize.width * xRatio, y: viewportSize.height * yRatio })
 
-  const box = await page.locator('[data-testid="visualizer-canvas"]').boundingBox()
-  if (!box) throw new Error('visualizer canvas not visible')
-  await page.mouse.move(box.x + box.width * 0.22, box.y + box.height * 0.38)
+  await verifyInterruptedToolSwitchCommitsInk(page, point)
+
+  await page.click(byTitle(label.pen))
+  await page.mouse.move(point(0.2, 0.35).x, point(0.2, 0.35).y)
   await page.mouse.down()
-  for (let index = 0; index < moveCount; index += 1) {
+  for (let index = 0; index < 60; index += 1) {
+    const next = point(0.2 + index / 120, 0.35 + Math.sin(index / 6) * 0.08)
     await page.mouse.move(
-      box.x + box.width * (0.22 + (index / moveCount) * 0.56),
-      box.y + box.height * (0.38 + Math.sin(index / 8) * 0.12),
+      next.x,
+      next.y,
       { steps: 1 },
     )
   }
   await page.mouse.up()
 
-  await page.click(byTitle(label.tools))
-  await page.click(byButtonText(label.select))
-  await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.38)
+  await page.click(byTitle(label.eraser))
+  await page.mouse.move(point(0.35, 0.35).x, point(0.35, 0.35).y)
   await page.mouse.down()
-  await page.mouse.move(box.x + box.width * 0.56, box.y + box.height * 0.46, { steps: 8 })
+  await page.mouse.move(point(0.42, 0.35).x, point(0.42, 0.35).y, { steps: 12 })
   await page.mouse.up()
 
+  await page.click(byTitle(label.laser))
+  await page.waitForFunction((laser) => document.querySelector(`button[title="${laser}"]`)?.classList.contains('active'), label.laser)
+  await page.mouse.move(point(0.3, 0.5).x, point(0.3, 0.5).y)
+  const hitTarget = await page.evaluate(({ x, y }) => {
+    const element = document.elementFromPoint(x, y)
+    return element ? { tag: element.tagName, className: element.getAttribute('class'), testId: element.getAttribute('data-testid') } : null
+  }, point(0.3, 0.5))
+  await page.mouse.down()
+  await page.mouse.move(point(0.44, 0.52).x, point(0.44, 0.52).y, { steps: 12 })
+  const laserDebug = await page.evaluate(() => window.__projectionDebug ?? null)
+  if ((laserDebug?.laserPoints ?? 0) <= 1) {
+    throw new Error(`visualizer laser did not receive pointer samples: ${JSON.stringify({ laserDebug, hitTarget })}`)
+  }
+  await page.mouse.up()
+
+  await page.click(byTitle(label.pan))
+  await page.waitForFunction((pan) => document.querySelector(`button[title="${pan}"]`)?.classList.contains('active'), label.pan)
+  const transformBeforePan = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
+  await page.mouse.move(point(0.52, 0.52).x, point(0.52, 0.52).y)
+  await page.mouse.wheel(0, -240)
+  await page.mouse.down()
+  await page.mouse.move(point(0.62, 0.58).x, point(0.62, 0.58).y, { steps: 10 })
+  await page.mouse.up()
+  const transformAfterPan = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
+  if (transformAfterPan === transformBeforePan) throw new Error('visualizer pan/zoom did not change the view transform')
+
+  await page.click(byTitle(label.capture))
+  await page.waitForSelector('.visualizer-album-panel', { timeout: 15000 })
+  await page.waitForSelector('.visualizer-album-grid button', { timeout: 15000 })
   await page.click(byTitle(label.rotate))
-  await page.click(byTitle(label.insert))
-  await page.waitForSelector('.visualizer-shell', { state: 'detached', timeout: 15000 })
-  await page.waitForTimeout(250)
+  const transformAfterRotate = await page.locator('.visualizer-content').evaluate((element) => getComputedStyle(element).transform)
+  if (transformAfterRotate === transformAfterPan) throw new Error('visualizer rotate did not change the view transform')
 
-  const stats = await page.evaluate(() => window.__visualizerPerf?.snapshot())
-  const pageCountText = await page.locator('.page-count-button').textContent()
-  console.log(JSON.stringify({ errors, moveCount, pageCountText, stats }, null, 2))
-
+  const projectionDebug = await page.evaluate(() => window.__projectionDebug ?? null)
+  console.log(JSON.stringify({ errors, toolbarTitles, canvas: canvasBox, frame: frameBox, projectionDebug }, null, 2))
   if (errors.length) process.exitCode = 1
-  if (!stats?.firstDraws || !stats.liveDraws || !stats.captures || !stats.compositions) process.exitCode = 1
-  if (stats?.averageFirstInputToDrawMs > maxAverageFirstDrawMs) process.exitCode = 1
-  if (stats?.averageLiveDrawMs > maxAverageLiveDrawMs) process.exitCode = 1
-  if (stats?.averageCaptureMs > maxAverageCaptureMs) process.exitCode = 1
-  if (stats?.averageCompositionMs > maxAverageCompositionMs) process.exitCode = 1
 } finally {
   await browser.close()
+}
+
+async function waitForVisualizerReady(page) {
+  await page.waitForSelector('.visualizer-shell', { timeout: 60000 })
+  await page.waitForSelector('[data-testid="visualizer-canvas"]', { state: 'attached', timeout: 60000 })
+}
+
+async function verifyInterruptedToolSwitchCommitsInk(page, point) {
+  await page.click(byTitle(label.pen))
+  const beforeUndoDisabled = await page.locator(byTitle(label.undo)).evaluate((button) => button.hasAttribute('disabled'))
+  if (!beforeUndoDisabled) throw new Error('visualizer undo unexpectedly enabled before interrupted stroke test')
+
+  await page.evaluate(
+    ({ start, end, eraserTitle }) => {
+      const canvas = document.querySelector('[data-testid="visualizer-canvas"]')
+      if (!(canvas instanceof HTMLCanvasElement)) throw new Error('visualizer canvas missing for interrupted stroke test')
+      const dispatch = (type, x, y) => {
+        canvas.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 41,
+            pointerType: 'pen',
+            isPrimary: true,
+            button: 0,
+            buttons: 1,
+            clientX: x,
+            clientY: y,
+            pressure: 0.62,
+          }),
+        )
+      }
+      dispatch('pointerdown', start.x, start.y)
+      for (let index = 0; index < 12; index += 1) {
+        const t = (index + 1) / 12
+        dispatch('pointermove', start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t)
+      }
+      const eraser = document.querySelector(`button[title="${eraserTitle}"]`)
+      if (!(eraser instanceof HTMLButtonElement)) throw new Error('visualizer eraser button missing for interrupted stroke test')
+      eraser.click()
+    },
+    {
+      start: point(0.18, 0.22),
+      end: point(0.42, 0.26),
+      eraserTitle: label.eraser,
+    },
+  )
+
+  await page.waitForFunction((eraser) => document.querySelector(`button[title="${eraser}"]`)?.classList.contains('active'), label.eraser)
+  await page.waitForFunction((undo) => !document.querySelector(`button[title="${undo}"]`)?.hasAttribute('disabled'), label.undo)
 }

@@ -10,7 +10,9 @@ const host = process.env.VISUALIZER_HOST ?? '127.0.0.1'
 const port = process.env.VISUALIZER_PORT ?? '5176'
 const url = `http://${host}:${port}/?perf=1`
 
-const server = spawnInRoot(node, [viteBin, '--mode', 'blank', '--host', host, '--port', port, '--strictPort'], {
+await assertPortIsFree(url)
+
+const server = spawnInRoot(node, [viteBin, '--mode', 'visualizer', '--host', host, '--port', port, '--strictPort'], {
   stdio: ['ignore', 'pipe', 'pipe'],
 })
 
@@ -27,6 +29,15 @@ try {
   })
 } finally {
   stopProcessTree(server)
+}
+
+async function assertPortIsFree(targetUrl) {
+  try {
+    await fetch(targetUrl, { signal: AbortSignal.timeout(1000) })
+    throw new Error(`Visualizer gate target is already serving before Vite starts: ${targetUrl}`)
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('already serving')) throw error
+  }
 }
 
 async function waitForServer(targetUrl) {

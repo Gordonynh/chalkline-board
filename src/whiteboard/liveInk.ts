@@ -44,8 +44,6 @@ function useLiveInk({
   refreshStageBounds,
 }: UseLiveInkOptions) {
   const eraserCursorBoundsRef = useRef<CursorBounds | null>(null)
-  const eraserCursorFrameRef = useRef<number | null>(null)
-  const pendingEraserCursorPointRef = useRef<BoardPointerPoint | null>(null)
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -62,20 +60,8 @@ function useLiveInk({
     context.clearRect(0, 0, viewport.width, viewport.height)
     lastPointRef.current = null
     eraserCursorBoundsRef.current = null
-    pendingEraserCursorPointRef.current = null
-    if (eraserCursorFrameRef.current !== null) {
-      window.cancelAnimationFrame(eraserCursorFrameRef.current)
-      eraserCursorFrameRef.current = null
-    }
     refreshStageBounds()
   }, [canvasRef, contextRef, lastPointRef, refreshStageBounds, viewport.height, viewport.width])
-
-  useEffect(
-    () => () => {
-      if (eraserCursorFrameRef.current !== null) window.cancelAnimationFrame(eraserCursorFrameRef.current)
-    },
-    [],
-  )
 
   const clearEraserCursor = useCallback(() => {
     const context = contextRef.current
@@ -93,11 +79,6 @@ function useLiveInk({
     contextRef.current?.clearRect(0, 0, viewport.width, viewport.height)
     lastPointRef.current = null
     eraserCursorBoundsRef.current = null
-    pendingEraserCursorPointRef.current = null
-    if (eraserCursorFrameRef.current !== null) {
-      window.cancelAnimationFrame(eraserCursorFrameRef.current)
-      eraserCursorFrameRef.current = null
-    }
   }, [clearTimerRef, contextRef, lastPointRef, viewport.height, viewport.width])
 
   const scheduleLiveInkClear = useCallback((delayMs = 220) => {
@@ -107,11 +88,6 @@ function useLiveInk({
       contextRef.current?.clearRect(0, 0, viewport.width, viewport.height)
       lastPointRef.current = null
       eraserCursorBoundsRef.current = null
-      pendingEraserCursorPointRef.current = null
-      if (eraserCursorFrameRef.current !== null) {
-        window.cancelAnimationFrame(eraserCursorFrameRef.current)
-        eraserCursorFrameRef.current = null
-      }
     }, delayMs)
   }, [clearTimerRef, contextRef, lastPointRef, viewport.height, viewport.width])
 
@@ -188,6 +164,8 @@ function useLiveInk({
 
   const paintEraserCursor = useCallback(
     (point: BoardPointerPoint | null) => {
+      const perfStart = perfStatsRef.current.enabled ? performance.now() : 0
+      const isFirstCursorDraw = eraserCursorBoundsRef.current === null
       clearEraserCursor()
       if (!point) return
       const context = contextRef.current
@@ -210,24 +188,32 @@ function useLiveInk({
       context.fill()
       context.stroke()
       context.restore()
+      if (perfStatsRef.current.enabled) {
+        const finishedAt = performance.now()
+        const elapsed = finishedAt - perfStart
+        const inputToDraw = Math.max(0, finishedAt - point.time)
+        const stats = perfStatsRef.current
+        stats.inputSamples += 1
+        stats.liveDraws += 1
+        stats.totalLiveDrawMs += elapsed
+        stats.maxLiveDrawMs = Math.max(stats.maxLiveDrawMs, elapsed)
+        stats.totalInputToDrawMs += inputToDraw
+        stats.maxInputToDrawMs = Math.max(stats.maxInputToDrawMs, inputToDraw)
+        if (isFirstCursorDraw) {
+          stats.firstDraws += 1
+          stats.totalFirstInputToDrawMs += inputToDraw
+          stats.maxFirstInputToDrawMs = Math.max(stats.maxFirstInputToDrawMs, inputToDraw)
+        }
+      }
     },
-    [clearEraserCursor, contextRef, eraserRadius],
+    [clearEraserCursor, contextRef, eraserRadius, perfStatsRef],
   )
-
-  const flushEraserCursor = useCallback(() => {
-    eraserCursorFrameRef.current = null
-    const point = pendingEraserCursorPointRef.current
-    pendingEraserCursorPointRef.current = null
-    paintEraserCursor(point)
-  }, [paintEraserCursor])
 
   const drawEraserCursor = useCallback(
     (point: BoardPointerPoint | null) => {
-      pendingEraserCursorPointRef.current = point
-      if (eraserCursorFrameRef.current !== null) return
-      eraserCursorFrameRef.current = window.requestAnimationFrame(flushEraserCursor)
+      paintEraserCursor(point)
     },
-    [flushEraserCursor],
+    [paintEraserCursor],
   )
 
   return {

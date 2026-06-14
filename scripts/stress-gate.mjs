@@ -5,9 +5,10 @@ import path from 'node:path'
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const node = process.execPath
 const viteBin = path.join('node_modules', 'vite', 'bin', 'vite.js')
-const probe = path.join('scripts', 'perf-probe.mjs')
-const host = process.env.WHITEBOARD_PERF_HOST ?? '127.0.0.1'
-const port = process.env.WHITEBOARD_PERF_PORT ?? '5175'
+const probe = path.join('scripts', 'stress-probe.mjs')
+const host = process.env.WHITEBOARD_STRESS_HOST ?? '127.0.0.1'
+const port = process.env.WHITEBOARD_STRESS_PORT ?? '5178'
+const scenario = process.env.WHITEBOARD_STRESS_SCENARIO ?? process.argv[2] ?? 'erase'
 const url = `http://${host}:${port}/?perf=1`
 
 await assertPortIsFree(url)
@@ -21,12 +22,11 @@ server.stderr.on('data', (chunk) => process.stderr.write(chunk))
 
 try {
   await waitForServer(url)
-  await run(node, [probe, url], {
-    WHITEBOARD_PERF_MOVES: process.env.WHITEBOARD_PERF_MOVES ?? '80',
-    WHITEBOARD_PERF_STROKES: process.env.WHITEBOARD_PERF_STROKES ?? '8',
-    WHITEBOARD_PERF_MAX_AVG_LIVE_DRAW_MS: process.env.WHITEBOARD_PERF_MAX_AVG_LIVE_DRAW_MS ?? '1',
-    WHITEBOARD_PERF_MAX_AVG_INPUT_TO_DRAW_MS: process.env.WHITEBOARD_PERF_MAX_AVG_INPUT_TO_DRAW_MS ?? '8',
-    WHITEBOARD_PERF_MAX_AVG_COMMITTED_RENDER_MS: process.env.WHITEBOARD_PERF_MAX_AVG_COMMITTED_RENDER_MS ?? '8',
+  await run(node, [probe, url, scenario], {
+    WHITEBOARD_STRESS_MAX_LIVE_DRAW_MS: process.env.WHITEBOARD_STRESS_MAX_LIVE_DRAW_MS ?? '16',
+    WHITEBOARD_STRESS_MAX_INPUT_TO_DRAW_MS: process.env.WHITEBOARD_STRESS_MAX_INPUT_TO_DRAW_MS ?? '32',
+    WHITEBOARD_STRESS_MAX_COMMITTED_RENDER_MS: process.env.WHITEBOARD_STRESS_MAX_COMMITTED_RENDER_MS ?? '24',
+    WHITEBOARD_STRESS_MAX_ERASE_ELAPSED_MS: process.env.WHITEBOARD_STRESS_MAX_ERASE_ELAPSED_MS ?? '5500',
   })
 } finally {
   stopProcessTree(server)
@@ -35,7 +35,7 @@ try {
 async function assertPortIsFree(targetUrl) {
   try {
     await fetch(targetUrl, { signal: AbortSignal.timeout(1000) })
-    throw new Error(`Perf gate target is already serving before Vite starts: ${targetUrl}`)
+    throw new Error(`Stress gate target is already serving before Vite starts: ${targetUrl}`)
   } catch (error) {
     if (error instanceof Error && error.message.includes('already serving')) throw error
   }

@@ -3,8 +3,112 @@ import type { Dispatch, SetStateAction } from 'react'
 import { getBuiltInBook } from '../books'
 import type { BuiltInBook } from '../books'
 import { SELECTED_BOOK_KEY, initialProject, makeId, saveProject } from './core'
-import type { BoardImage, BoardPage, BoardProject, HostCommand } from './core'
+import type { BoardImage, BoardPage, BoardPresentation, BoardProject, HostCommand } from './core'
 import { noteFileName, parseNoteFileText, serializeNoteFile } from './noteFormat'
+
+const PRESENTATION_PACKAGE_EXTENSIONS = ['.pptx', '.pptm', '.ppsx', '.ppsm', '.potx', '.potm']
+const WORD_PACKAGE_EXTENSIONS = ['.docx', '.docm', '.dotx', '.dotm']
+const SPREADSHEET_PACKAGE_EXTENSIONS = ['.xlsx', '.xlsm', '.xltx', '.xltm']
+const ODP_EXTENSIONS = ['.odp']
+const CONVERT_TO_PRESENTATION_EXTENSIONS = ['.ppt', '.pps', '.pot']
+const CONVERT_TO_WORD_EXTENSIONS = ['.doc', '.dot']
+const CONVERT_TO_SPREADSHEET_EXTENSIONS = ['.xls']
+const IMAGE_EXTENSIONS = ['.svg']
+const TEXT_LIKE_EXTENSIONS = ['.txt', '.md', '.csv', '.tsv', '.json', '.html', '.htm', '.xml', '.log', '.rtf', '.odt', '.ods']
+const PRESENTATION_PACKAGE_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-powerpoint.presentation.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.presentationml.slideshow',
+  'application/vnd.ms-powerpoint.slideshow.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.presentationml.template',
+  'application/vnd.ms-powerpoint.template.macroenabled.12',
+])
+const WORD_PACKAGE_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-word.document.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
+  'application/vnd.ms-word.template.macroenabled.12',
+])
+const SPREADSHEET_PACKAGE_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel.sheet.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.template',
+  'application/vnd.ms-excel.template.macroenabled.12',
+])
+const hasExtension = (name: string, extensions: readonly string[]) => extensions.some((extension) => name.endsWith(extension))
+
+const yieldToBrowser = () =>
+  new Promise<void>((resolve) => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve())
+    } else {
+      window.setTimeout(resolve, 0)
+    }
+  })
+
+const isSupportedImportFile = (file: File) => {
+  const name = file.name.toLowerCase()
+  return (
+    file.type.startsWith('image/') ||
+    hasExtension(name, IMAGE_EXTENSIONS) ||
+    file.type === 'application/pdf' ||
+    name.endsWith('.pdf') ||
+    PRESENTATION_PACKAGE_MIME_TYPES.has(file.type) ||
+    hasExtension(name, PRESENTATION_PACKAGE_EXTENSIONS) ||
+    WORD_PACKAGE_MIME_TYPES.has(file.type) ||
+    hasExtension(name, WORD_PACKAGE_EXTENSIONS) ||
+    SPREADSHEET_PACKAGE_MIME_TYPES.has(file.type) ||
+    hasExtension(name, SPREADSHEET_PACKAGE_EXTENSIONS) ||
+    file.type.startsWith('text/') ||
+    hasExtension(name, TEXT_LIKE_EXTENSIONS) ||
+    hasExtension(name, ODP_EXTENSIONS) ||
+    hasExtension(name, CONVERT_TO_PRESENTATION_EXTENSIONS) ||
+    hasExtension(name, CONVERT_TO_WORD_EXTENSIONS) ||
+    hasExtension(name, CONVERT_TO_SPREADSHEET_EXTENSIONS)
+  )
+}
+
+const isLegacyOfficeFile = (file: File) => {
+  const name = file.name.toLowerCase()
+  return (
+    hasExtension(name, CONVERT_TO_PRESENTATION_EXTENSIONS) ||
+    hasExtension(name, CONVERT_TO_WORD_EXTENSIONS) ||
+    hasExtension(name, CONVERT_TO_SPREADSHEET_EXTENSIONS)
+  )
+}
+
+const legacyOfficeTargetExtension = (file: File) => {
+  const name = file.name.toLowerCase()
+  if (hasExtension(name, CONVERT_TO_PRESENTATION_EXTENSIONS)) return 'PPTX'
+  if (hasExtension(name, CONVERT_TO_WORD_EXTENSIONS)) return 'DOCX'
+  if (hasExtension(name, CONVERT_TO_SPREADSHEET_EXTENSIONS)) return 'XLSX'
+  return 'OOXML'
+}
+
+type ImportResult = {
+  supportedFiles: number
+  importedPages: number
+  requestedLegacyOfficeConversions: number
+  skippedLegacyOfficeFiles: number
+  failedFiles: number
+}
+
+type ImportFilesOptions = {
+  preserveCurrentPages?: boolean
+}
+
+const statusForImportResult = (result: ImportResult) => {
+  const notes = [
+    result.requestedLegacyOfficeConversions > 0 ? `converting ${result.requestedLegacyOfficeConversions} legacy Office file(s)` : '',
+    result.skippedLegacyOfficeFiles > 0 ? `skipped ${result.skippedLegacyOfficeFiles} legacy Office file(s)` : '',
+    result.failedFiles > 0 ? `failed ${result.failedFiles} unreadable file(s)` : '',
+  ].filter(Boolean)
+  if (result.importedPages > 0) {
+    return `Imported ${result.importedPages} pages${notes.length ? `; ${notes.join('; ')}` : ''}`
+  }
+  if (notes.length) return notes.join('; ')
+  return 'No supported files imported'
+}
 
 interface UseProjectActionsOptions {
   project: BoardProject
@@ -72,7 +176,7 @@ function useProjectActions({
   const addBlankPage = useCallback(() => {
     const page: BoardPage = {
       id: makeId(),
-      name: `空白页 ${project.pages.length + 1}`,
+      name: `Blank page ${project.pages.length + 1}`,
       strokes: [],
       view: { x: 0, y: 0, scale: 1 },
     }
@@ -86,21 +190,52 @@ function useProjectActions({
   }, [project.pages.length, recordProjectHistory, setProject])
 
   const importFiles = useCallback(
-    async (files: FileList | File[]) => {
-      const supportedFiles = Array.from(files).filter((file) => file.type.startsWith('image/') || file.type === 'application/pdf')
-      if (!supportedFiles.length) return
-      setStatus('正在导入文件...')
+    async (files: FileList | File[], options: ImportFilesOptions = {}) => {
+      const supportedFiles = Array.from(files).filter(isSupportedImportFile)
+      if (!supportedFiles.length) {
+        return {
+          supportedFiles: 0,
+          importedPages: 0,
+          requestedLegacyOfficeConversions: 0,
+          skippedLegacyOfficeFiles: 0,
+          failedFiles: 0,
+        } satisfies ImportResult
+      }
+      setStatus('Importing files...')
       recordProjectHistory()
 
       let importedCount = 0
+      let skippedLegacyOfficeCount = 0
+      let requestedLegacyOfficeConversionCount = 0
+      let failedImportCount = 0
       let firstImportedId = ''
-      const appendImages = (images: BoardImage[]) => {
+      const recordImportAppend = (pages: BoardPage[], fileName: string) => {
+        const targetWindow = window as Window & {
+          __openWhiteboardImportEvents?: Array<{
+            fileName: string
+            appendedPages: number
+            importedCount: number
+            pageNames: string[]
+          }>
+        }
+        targetWindow.__openWhiteboardImportEvents ??= []
+        targetWindow.__openWhiteboardImportEvents.push({
+          fileName,
+          appendedPages: pages.length,
+          importedCount,
+          pageNames: pages.map((page) => page.image?.name ?? page.name),
+        })
+      }
+      const appendImages = (images: BoardImage[], sourceFileName: string, presentation?: { id: string; firstSlideIndex: number }) => {
         if (!images.length) return
-        const pages = images.map<BoardPage>((image) => {
+        const pages = images.map<BoardPage>((image, imageIndex) => {
           const page: BoardPage = {
             id: makeId(),
-            name: image.name || `讲义页 ${importedCount + 1}`,
+            name: image.name || `Imported page ${importedCount + 1}`,
             image,
+            presentation: presentation
+              ? { id: presentation.id, slideIndex: presentation.firstSlideIndex + imageIndex }
+              : undefined,
             strokes: [],
             view: { x: 0, y: 0, scale: 1 },
           }
@@ -110,7 +245,11 @@ function useProjectActions({
         })
         setProject((previous) => {
           const shouldReplaceEmptyPage =
-            previous.pages.length === 1 && !previous.pages[0].image && !previous.pages[0].strokes.length
+            !options.preserveCurrentPages &&
+            previous.pages.length === 1 &&
+            !previous.pages[0].image &&
+            !previous.pages[0].strokes.length &&
+            !(previous.pages[0].texts?.length)
           return {
             ...previous,
             pages: shouldReplaceEmptyPage ? pages : [...previous.pages, ...pages],
@@ -118,23 +257,119 @@ function useProjectActions({
             updatedAt: Date.now(),
           }
         })
+        recordImportAppend(pages, sourceFileName)
       }
 
-      const { readImageFile, readPdfFile } = await import('./importers')
+      const {
+        isDocxFile,
+        isOdpFile,
+        isPptxFile,
+        isSpreadsheetFile,
+        isSvgFile,
+        isTextLikeFile,
+        readDocxFile,
+        readFileAsDataUrl,
+        readOdpFile,
+        readImageFile,
+        readPdfFile,
+        readPptxFile,
+        readSpreadsheetFile,
+        readSvgFile,
+        readTextLikeFile,
+      } = await import('./importers')
       for (const file of supportedFiles) {
-        if (file.type === 'application/pdf') {
-          await readPdfFile(file, (image, pageNumber, totalPages) => {
-            appendImages([image])
-            setStatus(`正在导入 PDF：${pageNumber}/${totalPages}`)
-          })
-        } else {
-          appendImages([await readImageFile(file)])
-          setStatus(`已导入 ${importedCount} 页`)
+        try {
+          if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+            await readPdfFile(file, (image, pageNumber, totalPages) => {
+              appendImages([image], file.name)
+              setStatus(`Importing PDF: ${pageNumber}/${totalPages}`)
+            })
+          } else if (isPptxFile(file)) {
+            const presentationId = makeId()
+            const presentationSrc = await readFileAsDataUrl(file)
+            let slideCount = 0
+            await readPptxFile(file, (image, slideNumber, totalSlides) => {
+              slideCount = totalSlides
+              appendImages([image], file.name, { id: presentationId, firstSlideIndex: slideNumber - 1 })
+              setStatus(`Importing presentation: ${slideNumber}/${totalSlides}`)
+            })
+            const presentation: BoardPresentation = {
+              id: presentationId,
+              name: file.name,
+              kind: 'pptx',
+              src: presentationSrc,
+              slideCount,
+            }
+            setProject((previous) => ({
+              ...previous,
+              presentations: [...(previous.presentations ?? []), presentation],
+              updatedAt: Date.now(),
+            }))
+          } else if (isOdpFile(file)) {
+            appendImages(await readOdpFile(file), file.name)
+            setStatus(`Imported ODP: ${importedCount} pages`)
+          } else if (isDocxFile(file)) {
+            await readDocxFile(file, (image, pageNumber, totalPages) => {
+              appendImages([image], file.name)
+              setStatus(`Importing DOCX: ${pageNumber}/${totalPages}`)
+            })
+            setStatus(`Imported DOCX: ${importedCount} pages`)
+          } else if (isSpreadsheetFile(file)) {
+            await readSpreadsheetFile(file, (image, pageNumber, totalPages, sheetName) => {
+              appendImages([image], file.name)
+              setStatus(`Importing spreadsheet ${sheetName}: ${pageNumber}/${totalPages}`)
+            })
+            setStatus(`Imported spreadsheet: ${importedCount} pages`)
+          } else if (isSvgFile(file)) {
+            appendImages([await readSvgFile(file)], file.name)
+            setStatus(`Imported SVG: ${importedCount} pages`)
+          } else if (isTextLikeFile(file)) {
+            await readTextLikeFile(file, (image, pageNumber, totalPages) => {
+              appendImages([image], file.name)
+              setStatus(`Importing text: ${pageNumber}/${totalPages}`)
+            })
+            setStatus(`Imported text: ${importedCount} pages`)
+          } else if (isLegacyOfficeFile(file)) {
+            const webview = (window as Window & { chrome?: { webview?: { postMessage: (message: string) => void } } }).chrome?.webview
+            if (webview?.postMessage) {
+              const content = await readFileAsDataUrl(file)
+              webview.postMessage(
+                JSON.stringify({
+                  type: 'convert-office-file',
+                  fileName: file.name,
+                  content,
+                  preserveCurrentPages: Boolean(options.preserveCurrentPages),
+                }),
+              )
+              requestedLegacyOfficeConversionCount += 1
+              setStatus(`Converting ${file.name} to ${legacyOfficeTargetExtension(file)}...`)
+            } else {
+              skippedLegacyOfficeCount += 1
+              setStatus('Legacy Office files need PPTX/DOCX/XLSX conversion first; desktop mode can auto-convert with LibreOffice installed')
+            }
+          } else {
+            appendImages([await readImageFile(file)], file.name)
+            setStatus(`Imported ${importedCount} pages`)
+          }
+        } catch (error) {
+          failedImportCount += 1
+          console.warn(`Import failed for ${file.name}`, error)
+          setStatus(`Skipped unreadable file: ${file.name}`)
+        } finally {
+          await yieldToBrowser()
         }
       }
 
-      setStatus(`已导入 ${importedCount} 页`)
+      const result: ImportResult = {
+        supportedFiles: supportedFiles.length,
+        importedPages: importedCount,
+        requestedLegacyOfficeConversions: requestedLegacyOfficeConversionCount,
+        skippedLegacyOfficeFiles: skippedLegacyOfficeCount,
+        failedFiles: failedImportCount,
+      }
+      setStatus(statusForImportResult(result))
       window.setTimeout(fitPage, 100)
+      return result
     },
     [fitPage, recordProjectHistory, setProject, setStatus],
   )
@@ -143,11 +378,11 @@ function useProjectActions({
     const { exportProjectJson } = await import('./exporters')
     exportProjectJson(project)
     setMorePanelOpen(false)
-    setStatus('已导出白板笔记')
+    setStatus('Whiteboard note exported')
   }, [project, setMorePanelOpen, setStatus])
 
   const saveNow = useCallback(async () => {
-    setStatus('正在保存...')
+    setStatus('Saving...')
     const webview = (
       window as Window & {
         chrome?: { webview?: { postMessage: (message: string) => void } }
@@ -164,9 +399,9 @@ function useProjectActions({
           }),
         )
         setMorePanelOpen(false)
-        setStatus('正在保存白板笔记...')
+        setStatus('Saving whiteboard note...')
       } catch {
-        setStatus('保存失败')
+        setStatus('Save failed')
       }
       return
     }
@@ -175,16 +410,16 @@ function useProjectActions({
       const nextProject = { ...project, updatedAt: Date.now() }
       await saveProject(nextProject)
       setMorePanelOpen(false)
-      setStatus(`已保存 ${new Date(nextProject.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`)
+      setStatus(`Saved ${new Date(nextProject.updatedAt).toLocaleTimeString('en-US', { hour12: false })}`)
     } catch {
-      setStatus('保存失败')
+      setStatus('Save failed')
     }
   }, [project, setMorePanelOpen, setStatus])
 
   const resetCurrentView = useCallback(() => {
     fitPage()
     setMorePanelOpen(false)
-    setStatus('已重置视图')
+    setStatus('View reset')
   }, [fitPage, setMorePanelOpen, setStatus])
 
   const importProject = useCallback(
@@ -201,9 +436,9 @@ function useProjectActions({
           setProject({ ...parsed, bookId: parsedBook.id, updatedAt: Date.now() })
           setProjectReady(true)
           closePanels()
-          setStatus('已导入项目')
+          setStatus('Project imported')
         } catch {
-          setStatus('项目文件格式不正确')
+          setStatus('Project file format is invalid')
         }
       }
       reader.readAsText(file)
@@ -243,10 +478,10 @@ function useProjectActions({
       }
       if (command === 'close') {
         window.close()
-        setStatus('浏览器模式请直接关闭标签页')
+        setStatus('Close the browser tab to exit in browser mode')
         return
       }
-      setStatus('最小化仅在桌面版可用')
+      setStatus('Minimize is only available in the desktop app')
     },
     [setStatus],
   )
@@ -257,7 +492,7 @@ function useProjectActions({
     setSelectedTextId(null)
     clearLiveInkCanvas()
     resetStrokeInput()
-    setStatus('已清空当前页批注')
+    setStatus('Current page annotations cleared')
   }, [clearLiveInkCanvas, resetStrokeInput, setSelectedStrokeId, setSelectedTextId, setStatus, updateCurrentPage])
 
   const selectBuiltInBook = useCallback(
@@ -265,7 +500,7 @@ function useProjectActions({
       const nextBook = getBuiltInBook(bookId)
       if (nextBook.id === selectedBookId) {
         setBookPickerOpen(false)
-        setStatus(`当前书籍：${nextBook.shortTitle}`)
+        setStatus(`Current book: ${nextBook.shortTitle}`)
         return
       }
       void saveProject(project).catch(() => undefined)
@@ -280,7 +515,7 @@ function useProjectActions({
       setFuture([])
       clearLiveInkCanvas()
       resetStrokeInput()
-      setStatus(`正在打开 ${nextBook.shortTitle}...`)
+      setStatus(`Opening ${nextBook.shortTitle}...`)
     },
     [
       clearLiveInkCanvas,

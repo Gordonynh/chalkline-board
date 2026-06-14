@@ -25,6 +25,7 @@ const uiText = {
       select: '选择',
       pen: '软笔',
       eraser: '橡皮',
+      laser: '\u6fc0\u5149',
       pan: '漫游',
       undo: '撤销',
       visualizer: '展台',
@@ -34,7 +35,7 @@ const uiText = {
       more: '更多',
     },
     corner: {
-      importTitle: '导入图片或 PDF',
+      importTitle: '导入课件或文件',
       import: '导入',
       close: '关闭',
       minimize: '最小化',
@@ -84,8 +85,8 @@ const uiText = {
       closeToc: '关闭目录',
     },
     canvas: {
-      dropTitle: '拖入 JPG / PNG / PDF 开始批注',
-      dropSubtitle: '也可以点击底部导入按钮，批注会自动保存在本机。',
+      dropTitle: '拖入 PPT / PDF / Office / 图片 / 白板笔记开始批注',
+      dropSubtitle: '也可以点击导入按钮，导入内容和批注只保存在本机。',
       panHint: '漫游：单指拖动 · 双指缩放',
     },
     visualizer: {
@@ -153,6 +154,7 @@ const uiText = {
       select: 'Select',
       pen: 'Pen',
       eraser: 'Eraser',
+      laser: 'Laser',
       pan: 'Pan',
       undo: 'Undo',
       visualizer: 'Camera',
@@ -162,7 +164,7 @@ const uiText = {
       more: 'More',
     },
     corner: {
-      importTitle: 'Import image or PDF',
+      importTitle: 'Import courseware or files',
       import: 'Import',
       close: 'Close',
       minimize: 'Minimize',
@@ -212,8 +214,8 @@ const uiText = {
       closeToc: 'Close contents',
     },
     canvas: {
-      dropTitle: 'Drop JPG / PNG / PDF to start annotating',
-      dropSubtitle: 'You can also use the import button. Annotations are saved locally.',
+      dropTitle: 'Drop PPT, PDF, Office, image, text, or .owbn files',
+      dropSubtitle: 'You can also use the import button. Imported pages and annotations stay local.',
       panHint: 'Pan: one finger to drag · two fingers to zoom',
     },
     visualizer: {

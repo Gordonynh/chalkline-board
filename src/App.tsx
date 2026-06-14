@@ -11,22 +11,28 @@ import {
   EMPTY_PAGE_SIZE,
   SELECTED_BOOK_KEY,
   StrokeLines,
+  appendPointerSamples,
   colors,
   configurableTools,
   drawSignatureStroke,
+  finalizeVelocityStroke,
   getLastSelectedBookId,
   initialProject,
   isStoredProjectForBook,
   loadProject,
+  makeId,
+  makeTapStroke,
   nativePointerPressure,
   quickPenColors,
   screenToWorldPoint,
   saveProject,
   sourcePageForBoardPage,
   strokeIntersectsRect,
+  stripStrokeRuntimeState,
   translateStroke,
   zoomViewAtPoint,
 } from './whiteboard/core'
+import { eraseStrokesAtPoints, withDynamicEraserRadius } from './whiteboard/eraser'
 import { useTouchPanGesture } from './whiteboard/gestures'
 import type { PanStart } from './whiteboard/gestures'
 import { preloadDisplayImages, preloadImages, useCachedDisplayImage } from './whiteboard/imageCache'
@@ -96,14 +102,179 @@ type HostMessage = {
   type?: string
   content?: string
   fileName?: string
+  files?: Array<{
+    content?: string
+    fileName?: string
+  }>
+  preserveCurrentPages?: boolean
   path?: string
   error?: string
+}
+
+const fileFromDataUrl = (dataUrl: string, fileName: string) => {
+  const [header, payload] = dataUrl.split(',', 2)
+  const mime = header.match(/^data:([^;]+);base64$/)?.[1] ?? 'application/octet-stream'
+  const binary = atob(payload ?? '')
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return new File([bytes], fileName, { type: mime })
+}
+
+const filesFromHostImportMessage = (message: HostMessage) => {
+  const entries =
+    Array.isArray(message.files) && message.files.length
+      ? message.files
+      : typeof message.content === 'string' && message.fileName
+        ? [{ content: message.content, fileName: message.fileName }]
+        : []
+
+  return entries
+    .filter((entry): entry is { content: string; fileName: string } => typeof entry.content === 'string' && Boolean(entry.fileName))
+    .map((entry) => fileFromDataUrl(entry.content, entry.fileName))
+}
+
+const isWhiteboardNoteFile = (file: File) =>
+  file.name.toLowerCase().endsWith('.owbn') || file.type === 'application/vnd.open-whiteboard.note+json'
+
+const mayBeWhiteboardNoteJsonFile = (file: File) => {
+  const name = file.name.toLowerCase()
+  return isWhiteboardNoteFile(file) || name.endsWith('.json') || file.type === 'application/json'
+}
+
+const isEditablePasteTarget = (target: EventTarget | null) => {
+  if (!(target instanceof HTMLElement)) return false
+  const tagName = target.tagName
+  return target.isContentEditable || tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT'
+}
+
+const filesFromClipboard = (clipboardData: DataTransfer | null) => {
+  if (!clipboardData) return []
+  const files = [
+    ...Array.from(clipboardData.files),
+    ...Array.from(clipboardData.items)
+      .filter((item) => item.kind === 'file')
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file)),
+  ]
+  const seen = new Set<string>()
+  return files.filter((file) => {
+    const key = `${file.name}:${file.type}:${file.size}:${file.lastModified}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+const importableFilesFromClipboard = (clipboardData: DataTransfer | null) => {
+  const files = filesFromClipboard(clipboardData)
+  if (files.length || !clipboardData) return files
+
+  const html = clipboardData.getData('text/html').trim()
+  if (html) {
+    return [new File([html], 'pasted-clipboard.html', { type: 'text/html' })]
+  }
+
+  const text = clipboardData.getData('text/plain').trim()
+  if (text) {
+    return [new File([text], 'pasted-clipboard.txt', { type: 'text/plain' })]
+  }
+
+  return []
+}
+
+type DroppedDataTransferItem = DataTransferItem & {
+  webkitGetAsEntry?: () => FileSystemEntry | null
+}
+
+const MAX_DROPPED_DIRECTORY_FILES = 250
+
+const readDroppedEntryFile = (entry: FileSystemFileEntry) =>
+  new Promise<File>((resolve, reject) => {
+    entry.file(resolve, reject)
+  })
+
+const readDroppedDirectoryEntries = (entry: FileSystemDirectoryEntry) => {
+  const reader = entry.createReader()
+  const entries: FileSystemEntry[] = []
+  return new Promise<FileSystemEntry[]>((resolve, reject) => {
+    const readBatch = () => {
+      reader.readEntries(
+        (batch) => {
+          if (!batch.length) {
+            resolve(entries)
+            return
+          }
+          entries.push(...batch)
+          readBatch()
+        },
+        reject,
+      )
+    }
+    readBatch()
+  })
+}
+
+const filesFromDroppedEntry = async (entry: FileSystemEntry, remaining: { count: number }): Promise<File[]> => {
+  if (remaining.count <= 0) return []
+  if (entry.isFile) {
+    remaining.count -= 1
+    return [await readDroppedEntryFile(entry as FileSystemFileEntry)]
+  }
+  if (!entry.isDirectory) return []
+  const children = await readDroppedDirectoryEntries(entry as FileSystemDirectoryEntry)
+  const files: File[] = []
+  for (const child of children) {
+    files.push(...(await filesFromDroppedEntry(child, remaining)))
+    if (remaining.count <= 0) break
+  }
+  return files
+}
+
+const importableFilesFromDrop = async (dataTransfer: DataTransfer) => {
+  const entries = Array.from(dataTransfer.items ?? [])
+    .map((item) => (item as DroppedDataTransferItem).webkitGetAsEntry?.())
+    .filter((entry): entry is FileSystemEntry => Boolean(entry))
+  if (!entries.length) return Array.from(dataTransfer.files)
+
+  const remaining = { count: MAX_DROPPED_DIRECTORY_FILES }
+  const files: File[] = []
+  for (const entry of entries) {
+    files.push(...(await filesFromDroppedEntry(entry, remaining)))
+    if (remaining.count <= 0) break
+  }
+  return files
+}
+
+type PresentationRuntime = {
+  show: {
+    stop: () => void
+    next: () => Promise<void>
+    prev: () => Promise<void>
+    goto: (index: number) => Promise<void>
+    toggleAutoPlay: () => void
+    currentIndex: number
+    slideCount: number
+    animationClick?: number
+    maxAnimationClick?: number
+    animationCacheSize?: number
+    slideCacheSize?: number
+    slideCachePending?: number
+    navigationBusy?: boolean
+    navigationQueueSize?: number
+    autoPlaying?: boolean
+  }
+  renderer: { destroy: () => void }
+  disposeInk?: () => void
+  restoreConsoleWarn?: () => void
 }
 
 declare global {
   interface Window {
     __openWhiteboardHostMessages?: unknown[]
     __openWhiteboardHostBridgeInstalled?: boolean
+    __openWhiteboardHostMessagesFlushed?: boolean
     chrome?: {
       webview?: {
         addEventListener?: (type: 'message', listener: (event: MessageEvent) => void) => void
@@ -127,6 +298,15 @@ const installEarlyHostMessageBridge = () => {
 
 installEarlyHostMessageBridge()
 
+const flushEarlyHostMessages = () => {
+  if (window.__openWhiteboardHostMessagesFlushed) return
+  window.__openWhiteboardHostMessagesFlushed = true
+  window.__openWhiteboardHostMessages?.splice(0).forEach((payload) => {
+    window.dispatchEvent(new MessageEvent('message', { data: payload }))
+  })
+  window.__openWhiteboardHostMessages = undefined
+}
+
 const preloadAroundCurrentPage = (project: BoardProject) => {
   const currentIndex = Math.max(0, project.pages.findIndex((page) => page.id === project.currentPageId))
   const sources = project.pages
@@ -142,6 +322,14 @@ const displayMaxDimensionForView = (scale: number) => {
   if (scale > 0.62) return 2200
   return 1600
 }
+
+const PRESENTATION_BLOB_CACHE_LIMIT = 3
+const PRESENTATION_SLIDE_RENDER_CACHE_RADIUS = 1
+const PRESENTATION_SLIDE_RENDER_CACHE_LIMIT = PRESENTATION_SLIDE_RENDER_CACHE_RADIUS * 2 + 1
+const PRESENTATION_ANIMATION_CACHE_RADIUS = 2
+const PRESENTATION_ANIMATION_CACHE_LIMIT = PRESENTATION_ANIMATION_CACHE_RADIUS * 2 + 1
+const PRESENTATION_OVERLAY_MONITOR_INTERVAL_MS = 160
+const PRESENTATION_AUTO_PLAY_INTERVAL_MS = 1800
 
 const initialPerfStats = (enabled = false): WhiteboardPerfStats => ({
   enabled,
@@ -181,6 +369,7 @@ function App() {
     view: PageView
     viewport: { width: number; height: number }
   } | null>(null)
+  const skipNextEraserPreviewCommitRenderRef = useRef(false)
   const pendingCommittedStrokeRef = useRef<Stroke | null>(null)
   const previewEraserPointRef = useRef<BoardPointerPoint | null>(null)
   const eraserPreviewActiveRef = useRef(false)
@@ -195,6 +384,8 @@ function App() {
   const laserPointSeq = useRef(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const projectInputRef = useRef<HTMLInputElement>(null)
+  const presentationRuntimeRef = useRef<PresentationRuntime | null>(null)
+  const presentationBlobCacheRef = useRef<Map<string, { src: string; blob: Blob }>>(new Map())
   const saveTimer = useRef<number | undefined>(undefined)
   const activePointerId = useRef<number | null>(null)
   const capturedPointerTarget = useRef<Element | null>(null)
@@ -256,6 +447,16 @@ function App() {
     () => project.pages.find((page) => page.id === project.currentPageId) ?? project.pages[0],
     [project.currentPageId, project.pages],
   )
+  const currentPresentation = useMemo(
+    () => project.presentations?.find((presentation) => presentation.id === currentPage.presentation?.id),
+    [currentPage.presentation?.id, project.presentations],
+  )
+  useEffect(() => {
+    const validPresentationIds = new Set((project.presentations ?? []).map((presentation) => presentation.id))
+    for (const presentationId of presentationBlobCacheRef.current.keys()) {
+      if (!validPresentationIds.has(presentationId)) presentationBlobCacheRef.current.delete(presentationId)
+    }
+  }, [project.presentations])
   const [currentView, setCurrentView] = useState<PageView>(currentPage.view)
   const pageIndex = project.pages.findIndex((page) => page.id === currentPage.id)
   const currentPageName = currentPage.name.replace(/^白板 /, language === 'en' ? 'Board ' : '白板 ')
@@ -517,7 +718,7 @@ function App() {
   }, [applyCurrentView, blankCanvas, documentSize.height, documentSize.width, viewport.height, viewport.width])
 
   const openNoteText = useCallback(
-    (text: string, sourceName = 'Whiteboard note') => {
+    (text: string, sourceName = 'Whiteboard note', afterOpen?: () => void) => {
       try {
         const parsed = parseNoteFileText(text)
         const parsedBook = getBuiltInBook(parsed.bookId || currentBook.id)
@@ -538,7 +739,10 @@ function App() {
         setTocOpen(false)
         setPageJumpOpen(false)
         setStatus(labels.status.loaded(sourceName))
-        window.setTimeout(fitPage, 80)
+        window.setTimeout(() => {
+          fitPage()
+          afterOpen?.()
+        }, 80)
       } catch {
         setStatus(language === 'en' ? 'Whiteboard note file is invalid' : '白板笔记文件格式不正确')
       }
@@ -588,16 +792,12 @@ function App() {
   useEffect(() => {
     const openFromMessage = (payload: unknown) => {
       const message = payload as HostMessage
-      if (message?.type === 'open-note-file' && typeof message.content === 'string') {
-        openNoteText(message.content, message.fileName || 'Whiteboard note')
-        return
-      }
       if (message?.type === 'save-note-file-result') {
-        setStatus(message.path ? (language === 'en' ? `Saved ${message.path}` : `已保存 ${message.path}`) : message.error || labels.status.autoSaveFailed)
+        setStatus(message.path ? `Saved ${message.path}` : message.error || labels.status.autoSaveFailed)
         return
       }
       if (message?.type === 'autosave-note-file-result' && message.error) {
-        setStatus(language === 'en' ? `Auto-save failed: ${message.error}` : `自动保存失败：${message.error}`)
+        setStatus(`Auto-save failed: ${message.error}`)
       }
     }
     const handleWindowMessage = (event: MessageEvent) => openFromMessage(event.data)
@@ -605,14 +805,12 @@ function App() {
 
     window.addEventListener('message', handleWindowMessage)
     webview?.addEventListener?.('message', handleWindowMessage)
-    window.__openWhiteboardHostMessages?.splice(0).forEach(openFromMessage)
-    window.__openWhiteboardHostMessages = undefined
     webview?.postMessage?.('app-ready')
     return () => {
       window.removeEventListener('message', handleWindowMessage)
       webview?.removeEventListener?.('message', handleWindowMessage)
     }
-  }, [labels.status, language, openNoteText])
+  }, [labels.status, language])
 
   useEffect(() => {
     const onResize = () => {
@@ -709,6 +907,18 @@ function App() {
 
   useEffect(() => {
     if (eraserPreviewActiveRef.current) return
+    if (skipNextEraserPreviewCommitRenderRef.current) {
+      skipNextEraserPreviewCommitRenderRef.current = false
+      committedInkCacheRef.current = {
+        pageId: currentPage.id,
+        view: currentView,
+        viewport,
+      }
+      committedInkImageRef.current?.position({ x: 0, y: 0 })
+      committedInkImageRef.current?.scale({ x: 1, y: 1 })
+      committedInkImageRef.current?.getLayer()?.batchDraw()
+      return
+    }
     if (isPanning && committedInkCacheRef.current) return
     if (committedInkRenderFrame.current !== null) window.cancelAnimationFrame(committedInkRenderFrame.current)
     committedInkRenderFrame.current = window.requestAnimationFrame(() => {
@@ -979,6 +1189,7 @@ function App() {
     const bounds = getStageBounds()
     if (!bounds) return []
     const view = currentViewRef.current
+    const receivedAt = performance.now()
     const coalescedEvents =
       typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : []
     const sourceEvents = coalescedEvents.length ? coalescedEvents : [event]
@@ -989,13 +1200,14 @@ function App() {
     for (const sampleEvent of sourceEvents) {
       const screenX = sampleEvent.clientX - bounds.left
       const screenY = sampleEvent.clientY - bounds.top
+      const sampleTime = sampleEvent.timeStamp
       samples.push({
         x: (screenX - view.x) / view.scale,
         y: (screenY - view.y) / view.scale,
         screenX,
         screenY,
         pressure: nativePointerPressure(sampleEvent),
-        time: sampleEvent.timeStamp,
+        time: receivedAt - sampleTime > 64 ? receivedAt : sampleTime,
       })
     }
     if (samples.length) return samples
@@ -1155,6 +1367,9 @@ function App() {
     drawLiveInkSamples,
     drawEraserCursor,
     previewErasePoints,
+    onEraserPreviewCommit: () => {
+      skipNextEraserPreviewCommitRenderRef.current = true
+    },
   })
 
   const {
@@ -1194,6 +1409,109 @@ function App() {
     resetStrokeInput,
   })
 
+  useEffect(() => {
+    const openConvertedOfficeFile = async (payload: unknown) => {
+      const message = payload as HostMessage
+      if (message?.type === 'open-note-file' && typeof message.content === 'string') {
+        const files = Array.isArray(message.files) ? filesFromHostImportMessage({ files: message.files }) : []
+        openNoteText(message.content, message.fileName || 'Whiteboard note', files.length ? () => {
+          void importFiles(files, { preserveCurrentPages: true })
+        } : undefined)
+        return
+      }
+      if (message?.type === 'converted-office-file' && typeof message.content === 'string' && message.fileName) {
+        try {
+          setStatus(`Importing converted file: ${message.fileName}`)
+          const result = await importFiles(
+            [fileFromDataUrl(message.content, message.fileName)],
+            { preserveCurrentPages: Boolean(message.preserveCurrentPages) },
+          )
+          if (!result?.importedPages) setStatus(`Converted ${message.fileName}`)
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : 'Converted file could not be imported')
+        }
+        return
+      }
+      if (message?.type === 'open-import-file') {
+        const files = filesFromHostImportMessage(message)
+        if (!files.length) return
+        try {
+          setStatus(files.length === 1 ? `Importing ${files[0].name}` : `Importing ${files.length} startup files`)
+          if (files.length === 1 && mayBeWhiteboardNoteJsonFile(files[0])) {
+            try {
+              const text = await files[0].text()
+              parseNoteFileText(text)
+              openNoteText(text, files[0].name)
+              return
+            } catch {
+              // Plain JSON files should continue through the generic importer.
+            }
+          }
+          const result = await importFiles(files)
+          if (!result?.importedPages) setStatus(files.length === 1 ? `Imported ${files[0].name}` : `Imported ${files.length} startup files`)
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : 'Startup file could not be imported')
+        }
+        return
+      }
+      if (message?.type === 'convert-office-file-result' && message.error) {
+        setStatus(message.error)
+      }
+    }
+    const handleWindowMessage = (event: MessageEvent) => {
+      void openConvertedOfficeFile(event.data)
+    }
+    const webview = window.chrome?.webview
+    window.addEventListener('message', handleWindowMessage)
+    webview?.addEventListener?.('message', handleWindowMessage)
+    window.setTimeout(flushEarlyHostMessages, 0)
+    return () => {
+      window.removeEventListener('message', handleWindowMessage)
+      webview?.removeEventListener?.('message', handleWindowMessage)
+    }
+  }, [importFiles, importProject, openNoteText])
+
+  const importUserFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const fileList = Array.from(files)
+      let noteFile: File | undefined
+      for (const file of fileList) {
+        if (!mayBeWhiteboardNoteJsonFile(file)) continue
+        try {
+          parseNoteFileText(await file.text())
+          noteFile = file
+          break
+        } catch {
+          // Plain JSON files should still import as text pages.
+        }
+      }
+      if (noteFile) {
+        const remainingFiles = fileList.filter((file) => file !== noteFile)
+        openNoteText(await noteFile.text(), noteFile.name, remainingFiles.length ? () => {
+          void importFiles(remainingFiles, { preserveCurrentPages: true })
+        } : undefined)
+        return
+      }
+      void importFiles(fileList)
+    },
+    [importFiles, openNoteText],
+  )
+
+  useEffect(() => {
+    if (!importsEnabled) return
+    const handlePaste = (event: ClipboardEvent) => {
+      if (isEditablePasteTarget(event.target)) return
+      const files = importableFilesFromClipboard(event.clipboardData)
+      if (!files.length) return
+      event.preventDefault()
+      void importUserFiles(files)
+    }
+    window.addEventListener('paste', handlePaste)
+    return () => {
+      window.removeEventListener('paste', handlePaste)
+    }
+  }, [importUserFiles, importsEnabled])
+
   const handleCloseApp = useCallback(async () => {
     sendHostCommand('close')
   }, [sendHostCommand])
@@ -1207,6 +1525,1033 @@ function App() {
     setTocOpen(false)
     setPageJumpOpen(false)
   }, [])
+
+  const stopPresentationRuntime = useCallback(() => {
+    const runtime = presentationRuntimeRef.current
+    presentationRuntimeRef.current = null
+    runtime?.disposeInk?.()
+    runtime?.show.stop()
+    runtime?.restoreConsoleWarn?.()
+    runtime?.renderer.destroy()
+  }, [])
+
+  const attachPresentationInkOverlay = useCallback(
+    (
+      show: PresentationRuntime['show'],
+      presentationId: string,
+      slideCanvas: HTMLCanvasElement,
+      renderWarningState?: { seen: boolean },
+    ) => {
+      const fallbackCanvas = document.createElement('canvas')
+      const committedCanvas = document.createElement('canvas')
+      const canvas = document.createElement('canvas')
+      const toolbar = document.createElement('div')
+      const ratio = Math.max(1, Math.min(window.devicePixelRatio || 1, 2))
+      let overlayTool: 'select' | 'pen' | 'highlighter' | 'eraser' = 'select'
+      let draftStroke: Stroke | null = null
+      let lastEraserPoint: BoardPointerPoint | null = null
+      let selectStartPoint: BoardPointerPoint | null = null
+      let pointerId: number | null = null
+      let lastRenderedSlideIndex = show.currentIndex
+      let lastSlideRectKey = ''
+      let lastFallbackState = false
+      let slideMonitorFrame: number | null = null
+      let redrawFrame: number | null = null
+      let liveRedrawFrame: number | null = null
+      let committedRedrawFrame: number | null = null
+      let fallbackDrawVersion = 0
+      let rawPointerMoveSeen = false
+      let rawPointerUpdateCount = 0
+      const dirtyErasedSlideIndexes = new Set<number>()
+      const presentationDataset = new Map<string, string>()
+      const fallbackImageCache = new Map<string, HTMLImageElement>()
+      const rawPointerUpdatesEnabled = typeof window.PointerEvent !== 'undefined' && 'onpointerrawupdate' in window
+      const slidePages = new Map(
+        project.pages
+          .filter((page) => page.presentation?.id === presentationId && page.presentation.slideIndex !== undefined)
+          .map((page) => [page.presentation?.slideIndex ?? 0, page]),
+      )
+
+      const overlayCanvasStyle = [
+        'position:fixed',
+        'inset:0',
+        'touch-action:none',
+      ]
+      fallbackCanvas.style.cssText = [
+        ...overlayCanvasStyle,
+        'z-index:999999',
+        'pointer-events:none',
+        'display:none',
+      ].join(';')
+      committedCanvas.style.cssText = [
+        ...overlayCanvasStyle,
+        'z-index:1000000',
+        'pointer-events:none',
+      ].join(';')
+      canvas.style.cssText = [
+        ...overlayCanvasStyle,
+        'z-index:1000001',
+        'cursor:default',
+      ].join(';')
+      toolbar.style.cssText = [
+        'position:fixed',
+        'left:50%',
+        'bottom:24px',
+        'transform:translateX(-50%)',
+        'z-index:1000002',
+        'display:flex',
+        'gap:8px',
+        'padding:8px',
+        'border-radius:12px',
+        'background:rgba(255,255,255,0.92)',
+        'box-shadow:0 10px 28px rgba(15,23,42,0.22)',
+        'font:600 13px/1.2 system-ui,sans-serif',
+      ].join(';')
+
+      const makeButton = (label: string) => {
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.textContent = label
+        button.style.cssText = [
+          'min-width:54px',
+          'height:36px',
+          'border:1px solid rgba(15,23,42,0.14)',
+          'border-radius:8px',
+          'background:#fff',
+          'color:#334155',
+          'font:inherit',
+          'cursor:pointer',
+        ].join(';')
+        toolbar.appendChild(button)
+        return button
+      }
+
+      fallbackCanvas.dataset.presentationFallbackLayer = 'true'
+      canvas.dataset.presentationOverlay = 'true'
+      toolbar.dataset.presentationToolbar = 'true'
+      const selectButton = makeButton('\u9009\u62e9')
+      const penButton = makeButton('\u7b14')
+      const highlighterButton = makeButton('\u8367\u5149')
+      const eraserButton = makeButton('\u6a61\u76ae')
+      const playButton = makeButton('\u64ad\u653e')
+      const previousButton = makeButton('\u4e0a\u4e00\u9875')
+      const nextButton = makeButton('\u4e0b\u4e00\u9875')
+      const closeButton = makeButton('\u5173\u95ed')
+      selectButton.dataset.presentationAction = 'select'
+      penButton.dataset.presentationAction = 'pen'
+      highlighterButton.dataset.presentationAction = 'highlighter'
+      eraserButton.dataset.presentationAction = 'eraser'
+      playButton.dataset.presentationAction = 'autoplay'
+      previousButton.dataset.presentationAction = 'previous'
+      nextButton.dataset.presentationAction = 'next'
+      closeButton.dataset.presentationAction = 'close'
+
+      const syncToolButtons = () => {
+        selectButton.style.background = overlayTool === 'select' ? '#dff7f4' : '#fff'
+        penButton.style.background = overlayTool === 'pen' ? '#dff7f4' : '#fff'
+        highlighterButton.style.background = overlayTool === 'highlighter' ? '#fff7cc' : '#fff'
+        eraserButton.style.background = overlayTool === 'eraser' ? '#dff7f4' : '#fff'
+        playButton.style.background = show.autoPlaying ? '#dff7f4' : '#fff'
+        playButton.textContent = show.autoPlaying ? '\u6682\u505c' : '\u64ad\u653e'
+      }
+
+      selectButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        overlayTool = 'select'
+        canvas.style.cursor = 'default'
+        syncToolButtons()
+      })
+      penButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        overlayTool = 'pen'
+        canvas.style.cursor = 'crosshair'
+        syncToolButtons()
+      })
+      highlighterButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        overlayTool = 'highlighter'
+        canvas.style.cursor = 'crosshair'
+        syncToolButtons()
+      })
+      eraserButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        overlayTool = 'eraser'
+        canvas.style.cursor = 'cell'
+        syncToolButtons()
+      })
+      playButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        settlePendingOverlayEdits()
+        show.toggleAutoPlay()
+        syncToolButtons()
+      })
+      previousButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        settlePendingOverlayEdits()
+        void show.prev().then(redraw)
+      })
+      nextButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        settlePendingOverlayEdits()
+        void show.next().then(redraw)
+      })
+      closeButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        settlePendingOverlayEdits()
+        stopPresentationRuntime()
+      })
+      syncToolButtons()
+
+      const resize = () => {
+        for (const targetCanvas of [fallbackCanvas, committedCanvas, canvas]) {
+          targetCanvas.width = Math.max(1, Math.round(window.innerWidth * ratio))
+          targetCanvas.height = Math.max(1, Math.round(window.innerHeight * ratio))
+          targetCanvas.style.width = `${window.innerWidth}px`
+          targetCanvas.style.height = `${window.innerHeight}px`
+        }
+        redrawFallbackSlide()
+        redrawCommitted()
+        redrawLive()
+      }
+
+      const setPresentationDataset = (name: string, value: string) => {
+        if (presentationDataset.get(name) === value) return
+        presentationDataset.set(name, value)
+        canvas.setAttribute(name, value)
+      }
+
+      const syncPresentationDataset = () => {
+        setPresentationDataset('data-presentation-raw-pointer-updates', String(rawPointerUpdatesEnabled))
+        setPresentationDataset('data-presentation-raw-update-count', String(rawPointerUpdateCount))
+        setPresentationDataset('data-presentation-slide-index', String(show.currentIndex))
+        setPresentationDataset('data-presentation-animation-click', String(show.animationClick ?? 0))
+        setPresentationDataset('data-presentation-animation-max', String(show.maxAnimationClick ?? 0))
+        setPresentationDataset('data-presentation-animation-cache-size', String(show.animationCacheSize ?? 0))
+        setPresentationDataset('data-presentation-slide-cache-size', String(show.slideCacheSize ?? 0))
+        setPresentationDataset('data-presentation-slide-cache-pending', String(show.slideCachePending ?? 0))
+        setPresentationDataset('data-presentation-blob-cache-size', String(presentationBlobCacheRef.current.size))
+        setPresentationDataset('data-presentation-navigation-busy', String(Boolean(show.navigationBusy)))
+        setPresentationDataset('data-presentation-navigation-queue-size', String(show.navigationQueueSize ?? 0))
+        setPresentationDataset('data-presentation-autoplay', String(Boolean(show.autoPlaying)))
+        setPresentationDataset('data-presentation-fallback-slide', String(shouldUseFallbackSlide()))
+        setPresentationDataset('data-presentation-monitor-interval-ms', String(PRESENTATION_OVERLAY_MONITOR_INTERVAL_MS))
+        syncToolButtons()
+      }
+
+      const scheduleRedraw = () => {
+        if (redrawFrame !== null) return
+        redrawFrame = window.requestAnimationFrame(() => {
+          redrawFrame = null
+          redraw()
+        })
+      }
+
+      const scheduleLiveRedraw = () => {
+        if (liveRedrawFrame !== null) return
+        liveRedrawFrame = window.requestAnimationFrame(() => {
+          liveRedrawFrame = null
+          redrawLive()
+        })
+      }
+
+      const scheduleCommittedRedraw = () => {
+        if (committedRedrawFrame !== null) return
+        committedRedrawFrame = window.requestAnimationFrame(() => {
+          committedRedrawFrame = null
+          redrawCommitted()
+        })
+      }
+
+      const monitorSlideIndex = () => {
+        syncPresentationDataset()
+        const fallbackState = shouldUseFallbackSlide()
+        const rect = slideCanvasRect()
+        const slideRectKey = `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`
+        if (show.currentIndex !== lastRenderedSlideIndex) {
+          lastRenderedSlideIndex = show.currentIndex
+          lastSlideRectKey = slideRectKey
+          scheduleRedraw()
+        } else if (slideRectKey !== lastSlideRectKey) {
+          lastSlideRectKey = slideRectKey
+          scheduleRedraw()
+        } else if (fallbackState !== lastFallbackState) {
+          lastFallbackState = fallbackState
+          scheduleRedraw()
+        }
+        slideMonitorFrame = window.setTimeout(monitorSlideIndex, PRESENTATION_OVERLAY_MONITOR_INTERVAL_MS)
+      }
+
+      const slideCanvasRect = () => slideCanvas.getBoundingClientRect()
+
+      const currentSlidePage = () => slidePages.get(show.currentIndex)
+
+      const shouldUseFallbackSlide = () => Boolean(renderWarningState?.seen)
+
+      const loadFallbackImage = (src: string) => {
+        const cached = fallbackImageCache.get(src)
+        if (cached?.complete && cached.naturalWidth > 0) return Promise.resolve(cached)
+        return new Promise<HTMLImageElement>((resolve, reject) => {
+          const image = cached ?? new Image()
+          fallbackImageCache.set(src, image)
+          image.onload = () => resolve(image)
+          image.onerror = () => reject(new Error('Unable to load fallback presentation slide'))
+          if (!cached) image.src = src
+          else if (!image.src) image.src = src
+        })
+      }
+
+      const eventPoint = (event: PointerEvent): BoardPointerPoint | null => {
+        const page = currentSlidePage()
+        if (!page?.image) return null
+        const rect = slideCanvasRect()
+        const scale = rect.width / page.image.width
+        if (scale <= 0) return null
+        return {
+          x: (event.clientX - rect.left) / scale,
+          y: (event.clientY - rect.top) / scale,
+          screenX: event.clientX,
+          screenY: event.clientY,
+          pressure: event.pointerType === 'pen' && event.pressure > 0 ? event.pressure : undefined,
+          time: performance.now(),
+        }
+      }
+
+      const eventPoints = (event: PointerEvent) => {
+        const events = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [event]
+        return events.map((coalescedEvent) => eventPoint(coalescedEvent)).filter((point): point is BoardPointerPoint => Boolean(point))
+      }
+
+      const setupOverlayContext = (targetCanvas: HTMLCanvasElement) => {
+        const context = targetCanvas.getContext('2d')
+        if (!context) return null
+        context.setTransform(ratio, 0, 0, ratio, 0, 0)
+        context.clearRect(0, 0, window.innerWidth, window.innerHeight)
+        return context
+      }
+
+      const slideDrawingState = () => {
+        const page = currentSlidePage()
+        canvas.dataset.presentationStrokeCount = String(page?.strokes.length ?? 0)
+        canvas.dataset.presentationPointCount = String(page?.strokes.reduce((sum, stroke) => sum + stroke.points.length / 2, 0) ?? 0)
+        if (!page?.image) return null
+        const rect = slideCanvasRect()
+        const scale = rect.width / page.image.width
+        if (scale <= 0) return null
+        const lastStroke = page.strokes.at(-1)
+        const lastX = lastStroke?.points.at(-2)
+        const lastY = lastStroke?.points.at(-1)
+        canvas.dataset.presentationLastPointScreenX = lastX === undefined ? '' : String(rect.left + lastX * scale)
+        canvas.dataset.presentationLastPointScreenY = lastY === undefined ? '' : String(rect.top + lastY * scale)
+        return { page, rect, scale }
+      }
+
+      const drawStrokeOnContext = (context: CanvasRenderingContext2D, stroke: Stroke, widthScale: number) => {
+        context.save()
+        context.globalAlpha = stroke.opacity
+        context.globalCompositeOperation = stroke.kind === 'highlighter' ? 'multiply' : 'source-over'
+        if (stroke.kind === 'pen') {
+          drawSignatureStroke(context, stroke, widthScale)
+        } else {
+          context.strokeStyle = stroke.color
+          context.lineWidth = stroke.width * widthScale
+          context.lineCap = 'round'
+          context.lineJoin = 'round'
+          context.beginPath()
+          context.moveTo(stroke.points[0], stroke.points[1])
+          for (let index = 2; index < stroke.points.length; index += 2) {
+            context.lineTo(stroke.points[index], stroke.points[index + 1])
+          }
+          context.stroke()
+        }
+        context.restore()
+      }
+
+      function redrawFallbackSlide() {
+        const context = setupOverlayContext(fallbackCanvas)
+        if (!context) return
+        const useFallback = shouldUseFallbackSlide()
+        const state = slideDrawingState()
+        fallbackCanvas.style.display = useFallback && state ? 'block' : 'none'
+        fallbackCanvas.dataset.presentationFallbackVisible = String(useFallback && Boolean(state))
+        fallbackDrawVersion += 1
+        const drawVersion = fallbackDrawVersion
+        if (!useFallback || !state?.page.image?.src) return
+
+        const { rect } = state
+        void loadFallbackImage(state.page.image.src)
+          .then((image) => {
+            if (drawVersion !== fallbackDrawVersion) return
+            const nextContext = setupOverlayContext(fallbackCanvas)
+            if (!nextContext) return
+            fallbackCanvas.style.display = 'block'
+            nextContext.imageSmoothingEnabled = true
+            nextContext.imageSmoothingQuality = 'high'
+            nextContext.drawImage(image, rect.left, rect.top, rect.width, rect.height)
+          })
+          .catch(() => {
+            fallbackCanvas.style.display = 'none'
+            fallbackCanvas.dataset.presentationFallbackVisible = 'false'
+          })
+      }
+
+      function redrawCommitted() {
+        const context = setupOverlayContext(committedCanvas)
+        if (!context) return
+        const state = slideDrawingState()
+        if (!state) return
+        const { page, rect, scale } = state
+        context.save()
+        context.translate(rect.left, rect.top)
+        context.scale(scale, scale)
+        for (const stroke of page.strokes) {
+          drawStrokeOnContext(context, stroke, 1 / scale)
+        }
+        context.restore()
+      }
+
+      function redrawLive() {
+        const context = setupOverlayContext(canvas)
+        if (!context) return
+        const state = slideDrawingState()
+        if (!state || !draftStroke) return
+        const { rect, scale } = state
+        context.save()
+        context.translate(rect.left, rect.top)
+        context.scale(scale, scale)
+        if (draftStroke.kind === 'pen') {
+          context.globalAlpha = draftStroke.opacity
+          drawSignatureStroke(context, draftStroke, 1 / scale, 0.5)
+        } else {
+          drawStrokeOnContext(context, draftStroke, 1 / scale)
+        }
+        context.restore()
+      }
+
+      function redraw() {
+        syncPresentationDataset()
+        redrawFallbackSlide()
+        redrawCommitted()
+        redrawLive()
+      }
+
+      const persistOverlayProject = (nextProject: BoardProject) => {
+        const webview = window.chrome?.webview
+        if (webview?.postMessage) {
+          webview.postMessage(
+            JSON.stringify({
+              type: 'autosave-note-file',
+              fileName: noteFileName(),
+              content: serializeNoteFile(nextProject),
+            }),
+          )
+          return
+        }
+        void saveProject(nextProject).catch(() => undefined)
+      }
+
+      const commitDraftStroke = () => {
+        if (!draftStroke) return
+        const committed = stripStrokeRuntimeState(draftStroke.points.length < 4 ? makeTapStroke(draftStroke) : finalizeVelocityStroke(draftStroke))
+        const slideIndex = show.currentIndex
+        const page = slidePages.get(slideIndex)
+        if (page) slidePages.set(slideIndex, { ...page, strokes: [...page.strokes, committed] })
+        setProject((previous) => {
+          const nextProject = {
+            ...previous,
+            pages: previous.pages.map((page) =>
+              page.presentation?.id === presentationId && page.presentation.slideIndex === slideIndex
+                ? { ...page, strokes: [...page.strokes, committed] }
+                : page,
+            ),
+            updatedAt: Date.now(),
+          }
+          persistOverlayProject(nextProject)
+          return nextProject
+        })
+        draftStroke = null
+        scheduleLiveRedraw()
+        scheduleCommittedRedraw()
+      }
+
+      const flushErasedSlides = () => {
+        if (!dirtyErasedSlideIndexes.size) return
+        const dirtySlides = new Map<number, BoardPage>()
+        for (const slideIndex of dirtyErasedSlideIndexes) {
+          const page = slidePages.get(slideIndex)
+          if (page) dirtySlides.set(slideIndex, page)
+        }
+        dirtyErasedSlideIndexes.clear()
+        if (!dirtySlides.size) return
+        setProject((previous) => {
+          const nextProject = {
+            ...previous,
+            pages: previous.pages.map((page) => {
+              if (page.presentation?.id !== presentationId || page.presentation.slideIndex === undefined) return page
+              const erasedPage = dirtySlides.get(page.presentation.slideIndex)
+              return erasedPage ? { ...page, strokes: erasedPage.strokes } : page
+            }),
+            updatedAt: Date.now(),
+          }
+          persistOverlayProject(nextProject)
+          return nextProject
+        })
+      }
+
+      const settlePendingOverlayEdits = () => {
+        if (draftStroke) commitDraftStroke()
+        flushErasedSlides()
+      }
+
+      const eraseAtPoints = (points: BoardPointerPoint[]) => {
+        const trackedPoints = points.map((point) => {
+          const tracked = withDynamicEraserRadius(point, lastEraserPoint, eraserRadius)
+          lastEraserPoint = tracked
+          return tracked
+        })
+        if (!trackedPoints.length) return
+        const slideIndex = show.currentIndex
+        const localPage = slidePages.get(slideIndex)
+        if (!localPage) return
+        const result = eraseStrokesAtPoints(localPage.strokes, trackedPoints, eraserRadius, 1)
+        if (!result.changed) return
+        slidePages.set(slideIndex, { ...localPage, strokes: result.strokes })
+        dirtyErasedSlideIndexes.add(slideIndex)
+        scheduleCommittedRedraw()
+      }
+
+      const onPointerDown = (event: PointerEvent) => {
+        const point = eventPoint(event)
+        if (!point) return
+        if (event.button !== 0) return
+        event.preventDefault()
+        pointerId = event.pointerId
+        rawPointerMoveSeen = false
+        rawPointerUpdateCount = 0
+        setPresentationDataset('data-presentation-raw-update-count', String(rawPointerUpdateCount))
+        try {
+          canvas.setPointerCapture(event.pointerId)
+        } catch {
+          // Synthetic or interrupted pointer streams may not be capturable.
+        }
+        if (overlayTool === 'select') {
+          selectStartPoint = point
+          return
+        }
+        if (overlayTool === 'eraser') {
+          lastEraserPoint = null
+          eraseAtPoints([point])
+          return
+        }
+        const highlighter = overlayTool === 'highlighter'
+        draftStroke = {
+          id: makeId(),
+          kind: highlighter ? 'highlighter' : 'pen',
+          color: highlighter ? '#ffe45c' : strokeColor,
+          width: highlighter ? strokeWidth * 2.4 : strokeWidth,
+          opacity: highlighter ? 0.35 : 1,
+          points: [point.x, point.y],
+          pressures: [point.pressure ?? 0.96],
+          pressureSource: point.pressure === undefined ? 'velocity' : 'native',
+          lastInputTime: point.time,
+        }
+        scheduleLiveRedraw()
+      }
+
+      const handlePointerDrawingMove = (event: PointerEvent, source: 'raw' | 'move') => {
+        if (pointerId !== event.pointerId) return
+        const point = eventPoint(event)
+        if (!point) return
+        event.preventDefault()
+        if (overlayTool === 'select') return
+        if (source === 'raw') {
+          rawPointerMoveSeen = true
+          rawPointerUpdateCount += 1
+          setPresentationDataset('data-presentation-raw-update-count', String(rawPointerUpdateCount))
+        }
+        if (overlayTool === 'eraser') {
+          eraseAtPoints(eventPoints(event))
+          return
+        }
+        if (!draftStroke) return
+        appendPointerSamples(draftStroke, eventPoints(event), 1)
+        scheduleLiveRedraw()
+      }
+
+      const onPointerMove = (event: PointerEvent) => {
+        if (rawPointerMoveSeen && (overlayTool === 'pen' || overlayTool === 'highlighter' || overlayTool === 'eraser')) return
+        handlePointerDrawingMove(event, 'move')
+      }
+
+      const onPointerRawUpdate = (event: PointerEvent) => {
+        handlePointerDrawingMove(event, 'raw')
+      }
+
+      const onPointerRawUpdateEvent = (event: Event) => {
+        onPointerRawUpdate(event as PointerEvent)
+      }
+
+      const onPointerUp = (event: PointerEvent) => {
+        if (pointerId !== event.pointerId) return
+        const point = eventPoint(event)
+        if (overlayTool === 'select' && selectStartPoint && point) {
+          const distance = Math.hypot(point.screenX - selectStartPoint.screenX, point.screenY - selectStartPoint.screenY)
+          if (distance < 10) void show.next().then(redraw)
+        } else {
+          if (draftStroke && (overlayTool === 'pen' || overlayTool === 'highlighter')) {
+            appendPointerSamples(draftStroke, eventPoints(event), 1)
+            scheduleLiveRedraw()
+          }
+          if (overlayTool === 'eraser') eraseAtPoints(eventPoints(event))
+          if (draftStroke) commitDraftStroke()
+          if (overlayTool === 'eraser') flushErasedSlides()
+        }
+        pointerId = null
+        rawPointerMoveSeen = false
+        selectStartPoint = null
+        lastEraserPoint = null
+        try {
+          canvas.releasePointerCapture(event.pointerId)
+        } catch {
+          // Pointer capture can already be released by browser navigation.
+        }
+      }
+
+      const onKeyDown = (event: KeyboardEvent) => {
+        const stop = () => {
+          event.preventDefault()
+          event.stopPropagation()
+          event.stopImmediatePropagation()
+        }
+        if (['ArrowRight', 'ArrowDown', ' ', 'Enter', 'PageDown', 'n', 'N'].includes(event.key)) {
+          stop()
+          settlePendingOverlayEdits()
+          void show.next().then(redraw)
+        } else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace', 'p', 'P'].includes(event.key)) {
+          stop()
+          settlePendingOverlayEdits()
+          void show.prev().then(redraw)
+        } else if (event.key === 'Home') {
+          stop()
+          settlePendingOverlayEdits()
+          void show.goto(0).then(redraw)
+        } else if (event.key === 'End') {
+          stop()
+          settlePendingOverlayEdits()
+          void show.goto(show.slideCount - 1).then(redraw)
+        } else if (event.key === 'Escape') {
+          stop()
+          settlePendingOverlayEdits()
+          stopPresentationRuntime()
+        }
+      }
+
+      canvas.addEventListener('pointerdown', onPointerDown)
+      canvas.addEventListener('pointermove', onPointerMove)
+      if (rawPointerUpdatesEnabled) canvas.addEventListener('pointerrawupdate', onPointerRawUpdateEvent)
+      canvas.addEventListener('pointerup', onPointerUp)
+      canvas.addEventListener('pointercancel', onPointerUp)
+      document.addEventListener('keydown', onKeyDown, true)
+      window.addEventListener('resize', resize)
+      document.body.appendChild(fallbackCanvas)
+      document.body.appendChild(committedCanvas)
+      document.body.appendChild(canvas)
+      document.body.appendChild(toolbar)
+      resize()
+      syncPresentationDataset()
+      lastSlideRectKey = (() => {
+        const rect = slideCanvasRect()
+        return `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`
+      })()
+      slideMonitorFrame = window.setTimeout(monitorSlideIndex, PRESENTATION_OVERLAY_MONITOR_INTERVAL_MS)
+
+      return () => {
+        settlePendingOverlayEdits()
+        if (slideMonitorFrame !== null) window.clearTimeout(slideMonitorFrame)
+        if (redrawFrame !== null) window.cancelAnimationFrame(redrawFrame)
+        if (liveRedrawFrame !== null) window.cancelAnimationFrame(liveRedrawFrame)
+        if (committedRedrawFrame !== null) window.cancelAnimationFrame(committedRedrawFrame)
+        canvas.removeEventListener('pointerdown', onPointerDown)
+        canvas.removeEventListener('pointermove', onPointerMove)
+        if (rawPointerUpdatesEnabled) canvas.removeEventListener('pointerrawupdate', onPointerRawUpdateEvent)
+        canvas.removeEventListener('pointerup', onPointerUp)
+        canvas.removeEventListener('pointercancel', onPointerUp)
+        document.removeEventListener('keydown', onKeyDown, true)
+        window.removeEventListener('resize', resize)
+        fallbackCanvas.remove()
+        committedCanvas.remove()
+        canvas.remove()
+        toolbar.remove()
+      }
+    },
+    [eraserRadius, project.pages, setProject, stopPresentationRuntime, strokeColor, strokeWidth],
+  )
+
+  const playCurrentPresentation = useCallback(async () => {
+    if (!currentPresentation || !currentPage.presentation) return
+    closeFloatingPanels()
+    stopPresentationRuntime()
+    setStatus('Loading PPTX presentation...')
+
+    let cleanupRenderer: { destroy: () => void } | null = null
+    let cleanupShow: { stop: () => void } | null = null
+    const renderWarningState = { seen: false }
+    const originalConsoleWarn = console.warn.bind(console)
+    let consoleWarnRestored = false
+    const restoreConsoleWarn = () => {
+      if (consoleWarnRestored) return
+      consoleWarnRestored = true
+      console.warn = originalConsoleWarn
+    }
+    console.warn = (...args: unknown[]) => {
+      if (args.some((arg) => String(arg).includes('Error rendering shape'))) {
+        renderWarningState.seen = true
+      }
+      originalConsoleWarn(...args)
+    }
+    try {
+      const [{ PptxRenderer, SlideShow }, response] = await Promise.all([
+        import('pptx-browser'),
+        presentationBlobCacheRef.current.get(currentPresentation.id)?.src === currentPresentation.src
+          ? Promise.resolve(null)
+          : fetch(currentPresentation.src),
+      ])
+      let cachedBlob = presentationBlobCacheRef.current.get(currentPresentation.id)
+      if (!cachedBlob || cachedBlob.src !== currentPresentation.src) {
+        const blob = await response!.blob()
+        presentationBlobCacheRef.current.set(currentPresentation.id, { src: currentPresentation.src, blob })
+        while (presentationBlobCacheRef.current.size > PRESENTATION_BLOB_CACHE_LIMIT) {
+          const oldestKey = presentationBlobCacheRef.current.keys().next().value
+          if (!oldestKey) break
+          presentationBlobCacheRef.current.delete(oldestKey)
+        }
+        cachedBlob = presentationBlobCacheRef.current.get(currentPresentation.id)
+      }
+      const blob = cachedBlob?.blob
+      if (!blob) throw new Error('PPTX data unavailable')
+      const renderer = new PptxRenderer()
+      cleanupRenderer = renderer
+      await renderer.load(blob)
+      const show = new SlideShow(renderer, document.body, {
+        fullscreen: false,
+        showHud: true,
+        showThumbs: false,
+        showNotes: false,
+        onSlideChange: (index) => {
+          if (typeof index === 'number') setStatus(`PPTX ${index + 1}/${currentPresentation.slideCount}`)
+        },
+      })
+      cleanupShow = show
+      await show.start(currentPage.presentation.slideIndex)
+      const slideCanvas = (show as unknown as { _canvas?: HTMLCanvasElement })._canvas
+      if (!slideCanvas) throw new Error('PPTX player canvas unavailable')
+      const animationPlayer = renderer.createPlayer?.(slideCanvas)
+      let animationClick = 0
+      let animationClickGroups: number[] = []
+      let navigationBusy = false
+      let autoPlayTimer: number | undefined
+      type QueuedPresentationNavigation = { kind: 'next' } | { kind: 'prev' } | { kind: 'goto'; index: number }
+      const queuedNavigation: QueuedPresentationNavigation[] = []
+      const animationClickGroupCache = new Map<number, number[]>()
+      const pendingAnimationWarmups = new Set<number>()
+      const slideRenderCache = new Map<number, HTMLCanvasElement>()
+      const pendingSlideRenderWarmups = new Set<number>()
+      const playbackControllerRef: { current: PresentationRuntime['show'] | null } = { current: null }
+      const syncSlideCacheStats = () => {
+        if (!playbackControllerRef.current) return
+        playbackControllerRef.current.slideCacheSize = slideRenderCache.size
+        playbackControllerRef.current.slideCachePending = pendingSlideRenderWarmups.size
+      }
+      const pruneRenderedSlideCache = (anchorIndex = show.currentIndex) => {
+        for (const key of [...slideRenderCache.keys()]) {
+          if (Math.abs(key - anchorIndex) > PRESENTATION_SLIDE_RENDER_CACHE_RADIUS) slideRenderCache.delete(key)
+        }
+        while (slideRenderCache.size > PRESENTATION_SLIDE_RENDER_CACHE_LIMIT) {
+          const farthestKey = [...slideRenderCache.keys()]
+            .sort((left, right) => Math.abs(right - anchorIndex) - Math.abs(left - anchorIndex))[0]
+          if (farthestKey === undefined) break
+          slideRenderCache.delete(farthestKey)
+        }
+      }
+      const canvasRenderWidth = () => {
+        const canvas = (show as unknown as { _canvas?: HTMLCanvasElement })._canvas
+        if (!canvas) return 1280
+        return canvas.width / Math.max(1, window.devicePixelRatio || 1)
+      }
+      const cacheRenderedSlide = (slideIndex: number, sourceCanvas: HTMLCanvasElement) => {
+        const cached = document.createElement('canvas')
+        cached.width = sourceCanvas.width
+        cached.height = sourceCanvas.height
+        cached.getContext('2d')?.drawImage(sourceCanvas, 0, 0)
+        slideRenderCache.set(slideIndex, cached)
+        pruneRenderedSlideCache()
+        syncSlideCacheStats()
+      }
+      const renderSlideToCache = async (slideIndex: number) => {
+        if (slideIndex < 0 || slideIndex >= currentPresentation.slideCount) return
+        if (slideRenderCache.has(slideIndex) || pendingSlideRenderWarmups.has(slideIndex)) return
+        pendingSlideRenderWarmups.add(slideIndex)
+        syncSlideCacheStats()
+        try {
+          const cached = document.createElement('canvas')
+          await renderer.renderSlide(slideIndex, cached, canvasRenderWidth())
+          slideRenderCache.set(slideIndex, cached)
+          pruneRenderedSlideCache()
+        } finally {
+          pendingSlideRenderWarmups.delete(slideIndex)
+          syncSlideCacheStats()
+        }
+      }
+      const warmRenderedSlidesAround = (slideIndex: number) => {
+        const warmup = () => {
+          void renderSlideToCache(slideIndex - 1)
+          void renderSlideToCache(slideIndex + 1)
+        }
+        if (window.requestIdleCallback) {
+          window.requestIdleCallback(warmup, { timeout: 700 })
+        } else {
+          window.setTimeout(warmup, 0)
+        }
+      }
+      const showInternals = show as unknown as {
+        _renderCurrent?: (prevIndex?: number | null) => Promise<void>
+        _canvas?: HTMLCanvasElement
+        _updateThumbnail?: (index: number) => void
+        _updateNotes?: () => void
+      }
+      const originalRenderCurrent = showInternals._renderCurrent?.bind(show)
+      if (originalRenderCurrent) {
+        showInternals._renderCurrent = async (prevIndex: number | null = null) => {
+          const canvas = showInternals._canvas
+          if (!canvas) return
+          const transition = prevIndex !== null
+            ? (renderer as { getTransition?: (index: number) => { type?: string } | null }).getTransition?.(show.currentIndex)
+            : null
+          const cached = slideRenderCache.get(show.currentIndex)
+          if (!transition && cached && cached.width === canvas.width && cached.height === canvas.height) {
+            const context = canvas.getContext('2d')
+            if (context) {
+              context.setTransform(1, 0, 0, 1, 0, 0)
+              context.clearRect(0, 0, canvas.width, canvas.height)
+              context.drawImage(cached, 0, 0)
+              showInternals._updateThumbnail?.(show.currentIndex)
+              showInternals._updateNotes?.()
+              warmRenderedSlidesAround(show.currentIndex)
+              return
+            }
+          }
+          await originalRenderCurrent(prevIndex)
+          if (showInternals._canvas) cacheRenderedSlide(show.currentIndex, showInternals._canvas)
+          warmRenderedSlidesAround(show.currentIndex)
+        }
+      }
+      cacheRenderedSlide(show.currentIndex, slideCanvas)
+      const syncAnimationCacheStats = () => {
+        if (!playbackControllerRef.current) return
+        playbackControllerRef.current.animationCacheSize = animationClickGroupCache.size
+      }
+      const pruneAnimationCache = (anchorIndex = show.currentIndex) => {
+        for (const key of [...animationClickGroupCache.keys()]) {
+          if (Math.abs(key - anchorIndex) > PRESENTATION_ANIMATION_CACHE_RADIUS) animationClickGroupCache.delete(key)
+        }
+        while (animationClickGroupCache.size > PRESENTATION_ANIMATION_CACHE_LIMIT) {
+          const farthestKey = [...animationClickGroupCache.keys()]
+            .sort((left, right) => Math.abs(right - anchorIndex) - Math.abs(left - anchorIndex))[0]
+          if (farthestKey === undefined) break
+          animationClickGroupCache.delete(farthestKey)
+        }
+      }
+      const animationGroupsForSlide = (slideIndex: number) => {
+        const cached = animationClickGroupCache.get(slideIndex)
+        if (cached) return [...cached]
+        const groups = [...new Set((renderer.getAnimations?.(slideIndex) ?? [])
+          .map((step) => step.clickNum ?? 0)
+          .filter((clickNum) => clickNum > 0))]
+          .sort((a, b) => a - b)
+        animationClickGroupCache.set(slideIndex, groups)
+        pruneAnimationCache()
+        syncAnimationCacheStats()
+        return [...groups]
+      }
+      const warmAnimationGroupsAround = (slideIndex: number) => {
+        for (const nextIndex of [slideIndex - 1, slideIndex, slideIndex + 1]) {
+          if (nextIndex < 0 || nextIndex >= currentPresentation.slideCount) continue
+          if (animationClickGroupCache.has(nextIndex) || pendingAnimationWarmups.has(nextIndex)) continue
+          pendingAnimationWarmups.add(nextIndex)
+          const warmup = () => {
+            pendingAnimationWarmups.delete(nextIndex)
+            animationGroupsForSlide(nextIndex)
+          }
+          if (window.requestIdleCallback) {
+            window.requestIdleCallback(warmup, { timeout: 800 })
+          } else {
+            window.setTimeout(warmup, 0)
+          }
+        }
+      }
+      const loadSlideAnimations = async () => {
+        animationClick = 0
+        animationClickGroups = animationGroupsForSlide(show.currentIndex)
+        await animationPlayer?.loadSlide(show.currentIndex)
+        warmAnimationGroupsAround(show.currentIndex)
+        warmRenderedSlidesAround(show.currentIndex)
+      }
+      await loadSlideAnimations()
+      const syncNavigationQueueSize = () => {
+        if (playbackControllerRef.current) playbackControllerRef.current.navigationQueueSize = queuedNavigation.length
+      }
+      const clearAutoPlayTimer = () => {
+        if (autoPlayTimer !== undefined) {
+          window.clearTimeout(autoPlayTimer)
+          autoPlayTimer = undefined
+        }
+      }
+      const hasAutoPlayStep = () => animationClickGroups.length > 0 || show.currentIndex < currentPresentation.slideCount - 1
+      const scheduleAutoPlayStep = () => {
+        clearAutoPlayTimer()
+        if (!playbackControllerRef.current?.autoPlaying) return
+        if (!hasAutoPlayStep()) {
+          playbackControllerRef.current.autoPlaying = false
+          return
+        }
+        autoPlayTimer = window.setTimeout(() => {
+          autoPlayTimer = undefined
+          if (!playbackControllerRef.current?.autoPlaying) return
+          if (navigationBusy || queuedNavigation.length) {
+            scheduleAutoPlayStep()
+            return
+          }
+          void playbackController.next().then(scheduleAutoPlayStep)
+        }, PRESENTATION_AUTO_PLAY_INTERVAL_MS)
+      }
+      const enqueueNavigation = (navigation: QueuedPresentationNavigation) => {
+        if (navigation.kind === 'goto') {
+          queuedNavigation.length = 0
+        } else if (queuedNavigation.length >= 8) {
+          queuedNavigation.shift()
+        }
+        queuedNavigation.push(navigation)
+        syncNavigationQueueSize()
+      }
+      const runQueuedNavigation = () => {
+        const queued = queuedNavigation.shift()
+        syncNavigationQueueSize()
+        if (queued?.kind === 'next') {
+          void playbackController.next()
+        } else if (queued?.kind === 'prev') {
+          void playbackController.prev()
+        } else if (queued?.kind === 'goto') {
+          void playbackController.goto(queued.index)
+        }
+      }
+      const finishNavigation = () => {
+        navigationBusy = false
+        playbackController.navigationBusy = false
+        syncNavigationQueueSize()
+        if (queuedNavigation.length) window.setTimeout(runQueuedNavigation, 0)
+      }
+      const playbackController: PresentationRuntime['show'] = {
+        stop: () => {
+          queuedNavigation.length = 0
+          syncNavigationQueueSize()
+          clearAutoPlayTimer()
+          playbackController.autoPlaying = false
+          show.stop()
+        },
+        next: async () => {
+          if (navigationBusy) {
+            enqueueNavigation({ kind: 'next' })
+            return
+          }
+          navigationBusy = true
+          playbackController.navigationBusy = true
+          try {
+            if (animationPlayer && animationClickGroups.length) {
+              const targetClick = animationClickGroups.shift() ?? animationClick + 1
+              while (animationClick < targetClick) {
+                animationClick += 1
+                playbackController.animationClick = animationClick
+                await animationPlayer.nextClick()
+              }
+              playbackController.maxAnimationClick = animationClickGroups.at(-1) ?? animationClick
+              return
+            }
+            if (show.currentIndex >= currentPresentation.slideCount - 1) return
+            await show.goto(Math.min(show.currentIndex + 1, currentPresentation.slideCount - 1))
+            await loadSlideAnimations()
+            playbackController.animationClick = animationClick
+            playbackController.maxAnimationClick = animationClickGroups.at(-1) ?? 0
+          } finally {
+            finishNavigation()
+          }
+        },
+        prev: async () => {
+          if (navigationBusy) {
+            enqueueNavigation({ kind: 'prev' })
+            return
+          }
+          navigationBusy = true
+          playbackController.navigationBusy = true
+          try {
+            if (show.currentIndex <= 0) return
+            await show.goto(Math.max(show.currentIndex - 1, 0))
+            await loadSlideAnimations()
+            playbackController.animationClick = animationClick
+            playbackController.maxAnimationClick = animationClickGroups.at(-1) ?? 0
+          } finally {
+            finishNavigation()
+          }
+        },
+        goto: async (index: number) => {
+          const targetIndex = Math.max(0, Math.min(currentPresentation.slideCount - 1, Math.round(index)))
+          if (navigationBusy) {
+            enqueueNavigation({ kind: 'goto', index: targetIndex })
+            return
+          }
+          navigationBusy = true
+          playbackController.navigationBusy = true
+          try {
+            if (show.currentIndex === targetIndex) return
+            await show.goto(targetIndex)
+            await loadSlideAnimations()
+            playbackController.animationClick = animationClick
+            playbackController.maxAnimationClick = animationClickGroups.at(-1) ?? 0
+          } finally {
+            finishNavigation()
+          }
+        },
+        toggleAutoPlay: () => {
+          playbackController.autoPlaying = !playbackController.autoPlaying
+          if (playbackController.autoPlaying) scheduleAutoPlayStep()
+          else clearAutoPlayTimer()
+        },
+        get currentIndex() {
+          return show.currentIndex
+        },
+        slideCount: currentPresentation.slideCount,
+        animationClick,
+        maxAnimationClick: animationClickGroups.at(-1) ?? 0,
+        animationCacheSize: animationClickGroupCache.size,
+        slideCacheSize: slideRenderCache.size,
+        slideCachePending: pendingSlideRenderWarmups.size,
+        navigationBusy: false,
+        navigationQueueSize: 0,
+        autoPlaying: false,
+      }
+      playbackControllerRef.current = playbackController
+      const disposeInk = attachPresentationInkOverlay(playbackController, currentPresentation.id, slideCanvas, renderWarningState)
+      presentationRuntimeRef.current = { show: playbackController, renderer, disposeInk, restoreConsoleWarn }
+      cleanupShow = null
+      cleanupRenderer = null
+      setStatus(`PPTX ${currentPage.presentation.slideIndex + 1}/${currentPresentation.slideCount}`)
+    } catch (error) {
+      cleanupShow?.stop()
+      restoreConsoleWarn()
+      cleanupRenderer?.destroy()
+      setStatus(error instanceof Error ? error.message : 'Unable to play PPTX')
+    }
+  }, [attachPresentationInkOverlay, closeFloatingPanels, currentPage.presentation, currentPresentation, setStatus, stopPresentationRuntime])
+
+  useEffect(() => () => stopPresentationRuntime(), [stopPresentationRuntime])
 
   const handlePointerDown = (event: Konva.KonvaEventObject<PointerEvent>) => {
     refreshStageBounds()
@@ -1324,6 +2669,7 @@ function App() {
     }
     if (activeTool === 'pen' || activeTool === 'highlighter') commitStroke()
     if (activeTool === 'eraser') {
+      clearLiveInkCanvas()
       finishEraser()
       previewEraserPointRef.current = null
       eraserPreviewActiveRef.current = false
@@ -1374,15 +2720,35 @@ function App() {
     }
   }, [])
 
+  const settleActiveInputBeforeToolChange = () => {
+    const activeTool = transientToolRef.current ?? tool
+    if (activeTool === 'laser' && activePointerId.current !== null) scheduleLaserTrailClear()
+    if (isPanning) {
+      setIsPanning(false)
+      setPanStart(null)
+      commitInteractiveView()
+    }
+    if (isDrawingRef.current) {
+      if (activeTool === 'pen' || activeTool === 'highlighter') commitStroke()
+      if (activeTool === 'eraser') {
+        clearLiveInkCanvas()
+        finishEraser()
+        previewEraserPointRef.current = null
+        eraserPreviewActiveRef.current = false
+      }
+    }
+    transientToolRef.current = null
+    resetTouchPan()
+    releaseBoardPointer()
+  }
+
   const chooseTool = (nextTool: Tool) => {
+    settleActiveInputBeforeToolChange()
     const nextSettingsOpen = nextToolSettingsOpen(tool, nextTool, settingsOpen, configurableTools)
     const hasPendingCommittedStroke = Boolean(pendingCommittedStrokeRef.current)
     if (!hasPendingCommittedStroke) clearLiveInkCanvas()
     clearLaserTrail()
-    transientToolRef.current = null
     resetStrokeInput()
-    resetTouchPan()
-    releaseBoardPointer()
     setTool(nextTool)
     setBookPickerOpen(false)
     setExportPanelOpen(false)
@@ -1431,7 +2797,14 @@ function App() {
         importsEnabled
           ? (event) => {
               event.preventDefault()
-              importFiles(event.dataTransfer.files)
+              void importableFilesFromDrop(event.dataTransfer)
+                .then((files) => {
+                  if (files.length) void importUserFiles(files)
+                  else setStatus('No supported files imported')
+                })
+                .catch((error: unknown) => {
+                  setStatus(error instanceof Error ? error.message : 'Dropped files could not be imported')
+                })
             }
           : undefined
       }
@@ -1441,10 +2814,10 @@ function App() {
           ref={fileInputRef}
           className="hidden-input"
           type="file"
-          accept="image/png,image/jpeg,image/webp,application/pdf"
+          accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/avif,image/svg+xml,application/pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.avif,.svg,.ppt,.pps,.pot,.pptx,.pptm,.ppsx,.ppsm,.potx,.potm,.odp,.doc,.dot,.rtf,.docx,.docm,.dotx,.dotm,.odt,.xls,.xlsx,.xlsm,.xltx,.xltm,.ods,.txt,.md,.csv,.tsv,.json,.html,.htm,.xml,.log,.owbn,application/vnd.open-whiteboard.note+json,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/plain,text/markdown,text/csv,application/json"
           multiple
           onChange={(event) => {
-            if (event.target.files) void importFiles(event.target.files)
+            if (event.target.files) void importUserFiles(event.target.files)
             event.currentTarget.value = ''
           }}
         />
@@ -1737,6 +3110,7 @@ function App() {
         morePanelOpen={morePanelOpen}
         bookPickerEnabled={bookPickerEnabled}
         tocEnabled={tocEnabled}
+        presentationPlayable={Boolean(currentPresentation && currentPage.presentation)}
         bookPickerOpen={bookPickerOpen}
         tocOpen={tocOpen}
         onChooseTool={chooseTool}
@@ -1760,6 +3134,7 @@ function App() {
           setPageJumpOpen(false)
           setTocOpen(true)
         }}
+        onPlayPresentation={playCurrentPresentation}
         onToggleClock={() => {
           setBookPickerOpen(false)
           setSettingsOpen(false)

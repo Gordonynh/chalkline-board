@@ -1,4 +1,4 @@
-import { chromium } from '@playwright/test'
+import { launchHeadlessBrowser } from './playwright-browser.mjs'
 
 const targetUrl = process.argv[2] ?? 'http://127.0.0.1:5175/?perf=1'
 const scenario = process.argv[3] ?? 'all'
@@ -23,13 +23,15 @@ if (selectedScenarios.some(([, config]) => !config)) {
   throw new Error(`Unknown scenario "${scenario}". Use one of: ${Object.keys(scenarios).join(', ')}, all`)
 }
 
-const browser = await chromium.launch({ headless: true })
+const browser = await launchHeadlessBrowser()
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } })
 const errors = []
+page.setDefaultNavigationTimeout(90000)
+page.setDefaultTimeout(60000)
 page.on('pageerror', (error) => errors.push(String(error)))
 
-await page.goto(targetUrl, { waitUntil: 'networkidle' })
-await page.waitForSelector('.board-stage canvas', { timeout: 15000 })
+await page.goto(targetUrl, { waitUntil: 'domcontentloaded' })
+await waitForWhiteboardReady(page)
 
 const results = []
 for (const [name, config] of selectedScenarios) {
@@ -209,8 +211,13 @@ async function resetProject(page) {
       )
     }
   })
-  await page.reload({ waitUntil: 'networkidle' })
-  await page.waitForSelector('.board-stage canvas', { timeout: 15000 })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await waitForWhiteboardReady(page)
+}
+
+async function waitForWhiteboardReady(page) {
+  await page.waitForSelector('.whiteboard-app', { timeout: 60000 })
+  await page.waitForSelector('.board-stage canvas', { state: 'attached', timeout: 60000 })
 }
 
 async function performErase(page, moveCount) {
@@ -228,7 +235,7 @@ async function performErase(page, moveCount) {
     await page.mouse.move(box.x + box.width * (0.12 + ratio * 0.76), y + Math.sin(index / 9) * 36, { steps: 1 })
   }
   await page.mouse.up()
-  await page.waitForTimeout(120)
+  await page.waitForTimeout(40)
   return {
     elapsedMs: Date.now() - startedAt,
     stats: await page.evaluate(() => window.__whiteboardPerf?.snapshot()),
