@@ -144,29 +144,85 @@ function ProjectionApp() {
 
   useEffect(() => {
     let active = true
-    const videoElement = videoRef.current
+    let currentStream: MediaStream | null = null
     if (!navigator.mediaDevices?.getUserMedia) {
       window.setTimeout(() => setStatus(labels.visualizer.cameraUnsupported), 0)
       return
     }
-    void navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
-      .then((stream) => {
-        if (!active) {
-          stream.getTracks().forEach((track) => track.stop())
-          return
+
+    const attachStream = async (stream: MediaStream) => {
+      if (!active) {
+        stream.getTracks().forEach((track) => track.stop())
+        return true
+      }
+      currentStream = stream
+      const videoElement = videoRef.current
+      if (!videoElement) return true
+      videoElement.srcObject = stream
+      videoElement.muted = true
+      videoElement.playsInline = true
+      await videoElement.play().catch(() => undefined)
+      const label = stream.getVideoTracks()[0]?.label
+      setStatus(label || labels.visualizer.camera)
+      return true
+    }
+
+    const tryOpenCamera = async (constraints: MediaStreamConstraints) => {
+      try {
+        await attachStream(await navigator.mediaDevices.getUserMedia(constraints))
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    const openCamera = async () => {
+      const preferredConstraints: MediaStreamConstraints[] = [
+        {
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+          audio: false,
+        },
+        {
+          video: {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+          audio: false,
+        },
+        { video: true, audio: false },
+      ]
+
+      for (const constraints of preferredConstraints) {
+        if (!active) return
+        if (await tryOpenCamera(constraints)) return
+      }
+
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices?.()
+        const cameras = (devices ?? []).filter((device) => device.kind === 'videoinput')
+        for (const camera of cameras) {
+          if (!active) return
+          if (await tryOpenCamera({ video: { deviceId: { exact: camera.deviceId } }, audio: false })) return
         }
-        if (videoElement) {
-          videoElement.srcObject = stream
-          void videoElement.play().catch(() => undefined)
-        }
-      })
-      .catch(() => setStatus(labels.visualizer.openCameraFailed))
+      } catch {
+        // Device enumeration is optional; the generic attempts above already
+        // cover browsers and WebView2 builds that do not expose it.
+      }
+
+      if (active) setStatus(labels.visualizer.openCameraFailed)
+    }
+
+    void openCamera()
     return () => {
       active = false
-      const stream = videoElement?.srcObject
+      const stream = currentStream ?? videoRef.current?.srcObject
       if (stream instanceof MediaStream) stream.getTracks().forEach((track) => track.stop())
     }
-  }, [labels.visualizer.cameraUnsupported, labels.visualizer.openCameraFailed])
+  }, [labels.visualizer.camera, labels.visualizer.cameraUnsupported, labels.visualizer.openCameraFailed])
 
   const laserHeadPoint = useMemo(() => lastLaserTrailPoint(laserTrails), [laserTrails])
   const laserStyle = useMemo(() => ({
@@ -430,7 +486,7 @@ function ProjectionApp() {
             {activeCapture ? (
               <img className="visualizer-source" src={activeCapture} alt={labels.visualizer.capturedImage} />
             ) : (
-              <video ref={videoRef} className="visualizer-source" playsInline muted />
+              <video ref={videoRef} className="visualizer-source" playsInline muted autoPlay />
             )}
           </div>
           <canvas

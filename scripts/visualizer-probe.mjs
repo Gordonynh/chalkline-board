@@ -54,11 +54,22 @@ try {
       return canvas.captureStream(30)
     }
     const currentMediaDevices = navigator.mediaDevices ?? {}
+    const requests = []
     Object.defineProperty(navigator, 'mediaDevices', {
       configurable: true,
       value: {
         ...currentMediaDevices,
-        getUserMedia: async () => makeStream(),
+        enumerateDevices: async () => [
+          { kind: 'videoinput', deviceId: 'fake-default-camera', label: 'Fake default camera' },
+        ],
+        getUserMedia: async (constraints) => {
+          requests.push(constraints)
+          window.__visualizerCameraRequests = requests
+          if (requests.length === 1 && constraints?.video && typeof constraints.video === 'object' && 'facingMode' in constraints.video) {
+            throw new DOMException('No environment camera in this desktop test', 'OverconstrainedError')
+          }
+          return makeStream()
+        },
       },
     })
   })
@@ -68,6 +79,10 @@ try {
     const video = document.querySelector('video')
     return video instanceof HTMLVideoElement && video.videoWidth > 0 && video.videoHeight > 0
   })
+  const cameraRequests = await page.evaluate(() => window.__visualizerCameraRequests ?? [])
+  if (cameraRequests.length < 2) {
+    throw new Error(`visualizer did not retry camera after preferred constraint failed: ${JSON.stringify(cameraRequests)}`)
+  }
 
   const toolbarTitles = await page.locator('.visualizer-toolbar button').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('title')))
   const expectedToolbarTitles = [
